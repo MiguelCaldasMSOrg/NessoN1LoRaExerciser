@@ -17,6 +17,15 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Prepare Arduino sketch directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sketch_dir="$RUNNER_TEMP/NessoN1_LoRa_Exerciser"
+          mkdir -p "$sketch_dir"
+          cp NessoN1_LoRa_Exerciser.ino README.md FEATURES.md LICENSE "$sketch_dir/"
+
       - name: Install and run Arduino Lint
         shell: bash
         env:
@@ -36,7 +45,7 @@ jobs:
           chmod +x "$install_dir/arduino-lint"
 
           "$install_dir/arduino-lint" --version
-          "$install_dir/arduino-lint" --compliance strict --library-manager false --project-type sketch
+          "$install_dir/arduino-lint" --compliance strict --library-manager false --project-type sketch "$RUNNER_TEMP/NessoN1_LoRa_Exerciser"
 
       - name: Set up Arduino CLI
         shell: bash
@@ -72,4 +81,4 @@ jobs:
 
       - name: Compile Nesso N1 sketch
         shell: bash
-        run: arduino-cli compile --clean --fqbn esp32:esp32:arduino_nesso_n1 .
+        run: arduino-cli compile --clean --fqbn esp32:esp32:arduino_nesso_n1 "$RUNNER_TEMP/NessoN1_LoRa_Exerciser"
