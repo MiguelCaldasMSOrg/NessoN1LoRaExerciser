@@ -2,7 +2,7 @@
 
 An Arduino sketch for exercising the SX1262 LoRa radio on two Nesso N1 boards. Flash the same sketch to both boards and they will identify themselves from their ESP32 eFuse MAC addresses, discover each other, and exchange messages over LoRa.
 
-All sketch behavior and radio settings are contained in `NessoN1_LoRa_Exerciser.ino`. The repository's VS Code and GitHub configuration is optional; the sketch can be opened and uploaded directly with the Arduino IDE once the board support and required libraries are installed.
+All sketch behavior and radio settings are contained in `NessoN1LoRaExerciser.ino`. The repository's VS Code and GitHub configuration is optional; the sketch can be opened and uploaded directly with the Arduino IDE once the board support and required libraries are installed.
 
 See [FEATURES.md](FEATURES.md) for a complete introduction to LoRa and GFSK concepts, every exerciser feature and command, protocol behavior, limits, diagnostics, and guided experiments.
 
@@ -52,7 +52,7 @@ Compatible later versions may also work.
 ## Getting Started
 
 1. Install the required board support and libraries.
-2. Open `NessoN1_LoRa_Exerciser.ino`.
+2. Open `NessoN1LoRaExerciser.ino`.
 3. Review the LoRa profile near the top of the sketch. Both boards must use identical settings.
 4. Select the Nesso N1 board and the appropriate serial port.
 5. Upload the sketch to both boards.
@@ -64,7 +64,7 @@ Each board displays its eight-character node ID and periodically broadcasts disc
 
 ### Arduino IDE
 
-The workspace files are not required when using the Arduino IDE. Open `NessoN1_LoRa_Exerciser.ino`, select **Arduino Nesso N1**, select the board's serial port, and upload the sketch.
+The workspace files are not required when using the Arduino IDE. Open `NessoN1LoRaExerciser.ino`, select **Arduino Nesso N1**, select the board's serial port, and upload the sketch.
 
 ### Arduino CLI
 
@@ -75,14 +75,14 @@ $esp32Index = "https://espressif.github.io/arduino-esp32/package_esp32_index.jso
 arduino-cli core update-index --additional-urls $esp32Index
 arduino-cli core install esp32:esp32@3.3.11 --additional-urls $esp32Index
 arduino-cli lib install "Arduino_Nesso_N1@1.0.0" "RadioLib@7.7.1"
-arduino-cli compile --fqbn esp32:esp32:arduino_nesso_n1 --build-path ../NessoN1_LoRa_Exerciser-build .
+arduino-cli compile --fqbn esp32:esp32:arduino_nesso_n1 --build-path ../NessoN1LoRaExerciser-build .
 ```
 
 ### VS Code
 
-Open `NessoN1_LoRa_Exerciser.code-workspace` to use the repository configuration. It enables the installed Arduino CLI, selects the sketch and Nesso N1 board, associates `.ino` files with C++, and supplies explicit ESP32, Nesso, RadioLib, display, and sensor include paths.
+Open `NessoN1LoRaExerciser.code-workspace` to use the repository configuration. It enables the installed Arduino CLI, selects the sketch and Nesso N1 board, associates `.ino` files with C++, and supplies explicit ESP32, Nesso, RadioLib, display, and sensor include paths.
 
-The Arduino extension writes reusable build output to the sibling directory `../NessoN1_LoRa_Exerciser-build`. Arduino requires this directory to be outside the workspace. Its `compile_commands.json` is also used by C/C++ IntelliSense. Automatic IntelliSense generation is disabled so the checked-in configuration is not overwritten.
+The Arduino extension writes reusable build output to the sibling directory `../NessoN1LoRaExerciser-build`. Arduino requires this directory to be outside the workspace. Its `compile_commands.json` is also used by C/C++ IntelliSense. Automatic IntelliSense generation is disabled so the checked-in configuration is not overwritten.
 
 ## Runtime Behavior
 

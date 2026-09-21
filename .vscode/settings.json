@@ -9,7 +9,7 @@
         "*.ino": "cpp"
     },
     "C_Cpp.default.compilerPath": "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\tools\\esp-rv32\\2601\\bin\\riscv32-esp-elf-g++.exe",
-    "C_Cpp.default.compileCommands": "${workspaceFolder}/../NessoN1_LoRa_Exerciser-build/compile_commands.json",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/../NessoN1LoRaExerciser-build/compile_commands.json",
     "C_Cpp.default.includePath": [
         "${workspaceFolder}",
         "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\tools\\esp32c6-libs\\3.3.11\\include\\**",

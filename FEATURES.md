@@ -4,7 +4,7 @@ This document explains every feature exposed by the Nesso N1 LoRa Exerciser. It 
 
 The same sketch is normally loaded onto two Arduino Nesso N1 boards. The boards identify themselves, discover one another, exchange packets, and run controlled radio experiments. A third or additional boards are useful for peer-table, contention, slotted-access, and relay experiments.
 
-The implementation described here is [NessoN1_LoRa_Exerciser.ino](NessoN1_LoRa_Exerciser.ino).
+The implementation described here is [NessoN1LoRaExerciser.ino](NessoN1LoRaExerciser.ino).
 
 ## Read This First
 

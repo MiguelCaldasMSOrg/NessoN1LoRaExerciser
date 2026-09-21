@@ -1,6 +1,6 @@
 {
-    "sketch": "NessoN1_LoRa_Exerciser.ino",
+    "sketch": "NessoN1LoRaExerciser.ino",
     "board": "esp32:esp32:arduino_nesso_n1",
-    "output": "../NessoN1_LoRa_Exerciser-build",
+    "output": "../NessoN1LoRaExerciser-build",
     "intelliSenseGen": "disable"
 }

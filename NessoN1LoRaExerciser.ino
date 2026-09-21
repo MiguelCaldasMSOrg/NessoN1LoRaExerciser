@@ -61,10 +61,10 @@
       arduino-cli compile --clean --fqbn esp32:esp32:arduino_nesso_n1 .
 
   VS Code:
-    Open NessoN1_LoRa_Exerciser.code-workspace. The workspace enables the
+    Open NessoN1LoRaExerciser.code-workspace. The workspace enables the
     Arduino CLI and selects this sketch and the Nesso N1 board. The supplied
     Arduino extension configuration writes reusable output to the sibling
-    directory ../NessoN1_LoRa_Exerciser-build so builds are cached outside the
+    directory ../NessoN1LoRaExerciser-build so builds are cached outside the
     sketch directory. IntelliSense uses that directory's compile_commands.json
     plus explicit Nesso, ESP32, RadioLib, display, and sensor include paths.
 
