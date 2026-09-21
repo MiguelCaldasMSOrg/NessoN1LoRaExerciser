@@ -54,7 +54,7 @@ The exerciser spans several layers. Keeping them separate makes the observations
 
 The SX1262 is half-duplex: it cannot transmit and receive simultaneously. The sketch places it in standby before transmission and returns it to receive mode afterward. While transmitting, the onboard indicator is lit and the board's receive low-noise amplifier is disabled. The amplifier is restored for reception.
 
-The display and radio share a Serial Peripheral Interface bus. The board's control signals also use an Inter-Integrated Circuit bus through the Nesso N1 support hardware. These buses are board implementation details; the user normally interacts through the serial monitor, two buttons, and the display.
+The display and radio share a Serial Peripheral Interface bus. The board's control signals also use an Inter-Integrated Circuit bus through the Nesso N1 support hardware. These buses are board implementation details; the user normally interacts through the touchscreen, front button, remote command APIs, or serial monitor.
 
 ## LoRa Fundamentals
 
@@ -225,7 +225,7 @@ Actual range depends on antennas, polarization, height, terrain, Fresnel-zone cl
 
 ## Startup Defaults
 
-Every reset, upload, or deep-sleep wake starts from these values:
+When no valid stored configuration exists, reset, upload, or deep-sleep wake starts from these values. A valid stored configuration overrides the corresponding radio, packet, access, Wi-Fi, and Bluetooth values.
 
 | Setting | Startup value |
 | --- | --- |
@@ -245,16 +245,23 @@ Every reset, upload, or deep-sleep wake starts from these values:
 | Relay forwarding | Off |
 | Peer selection | Automatic |
 | Radio regulator selection | Low-dropout regulator mode |
+| Wi-Fi station SSID | Unset |
+| Wi-Fi station address | DHCP |
+| Recovery access point | Fixed `Nesso-<node-id>`, password `nesso-lora`, `192.168.4.1/24` |
+| Bluetooth Low Energy name | `Nesso-<node-id>`; unpaired and unencrypted |
 
 Startup proceeds as follows:
 
 1. The serial connection starts at 115,200 bits per second and waits for a host for up to two seconds.
 2. The node identifier is derived from the ESP32-C6 electronic-fuse Media Access Control address.
-3. Board input/output, radio power, antenna controls, display, and shared bus are initialized.
-4. The SX1262 starts in the default LoRa configuration and enters receive mode.
-5. An immediate broadcast `HELLO` packet is sent if radio initialization succeeded.
-6. The first periodic `HELLO` is scheduled 25 to almost 30 seconds later.
-7. The first telemetry packet is scheduled 15 to almost 30 seconds later.
+3. The versioned configuration blob is read and validated from Non-Volatile Storage; defaults remain active if it is absent or invalid.
+4. Board input/output, radio power, antenna controls, display, and shared bus are initialized.
+5. The SX1262 starts with the restored LoRa/GFSK and packet configuration and enters receive mode.
+6. The board attempts the configured Wi-Fi station for 12 seconds, then starts the fixed recovery access point if credentials are absent or association fails.
+7. The HTTP server and Bluetooth Low Energy service start.
+8. An immediate broadcast `HELLO` packet is sent if radio initialization succeeded.
+9. The first periodic `HELLO` is scheduled 25 to almost 30 seconds later.
+10. The first telemetry packet is scheduled 15 to almost 30 seconds later.
 
 The timing offsets are deterministic values derived from the node identifier. They spread two boards' periodic traffic without requiring synchronized clocks. Later `HELLO` intervals are 25 to almost 30 seconds, and later telemetry intervals are 60 to almost 75 seconds.
 
@@ -268,27 +275,107 @@ The input buffer holds approximately 1,232 characters so that a maximum-length t
 
 ### Buttons
 
-The two buttons are edge-triggered with a 250-millisecond debounce interval.
+Only the accessible front button is polled. It is edge-triggered with a 250-millisecond debounce interval.
 
 | Button | Action |
 | --- | --- |
-| `KEY1`, shown as Button A | Sends `Button A from <node-id>` as an acknowledged text message |
-| `KEY2`, shown as Button B | Sends local telemetry |
+| Front `KEY1` | Ping while Home is visible, apply an on-screen radio confirmation, or return to Home from another page |
+| Side `KEY2` | Intentionally unused because it is difficult to operate in the enclosure |
 
-Button A obeys the same one-pending-text and long-running-exercise restrictions as the `t` command. Button B obeys the normal transmit-access controls.
+The front-button ping obeys the same transmit-access controls as a serial `p` command.
 
-### Display
+### Touchscreen
 
-The liquid-crystal display shows:
+The 240-by-135 landscape touchscreen is the primary disconnected interface. A persistent bottom navigation bar selects five pages:
 
-- the `N1 LoRa` title;
-- this board's eight-character node identifier;
-- the selected or most recently heard peer, or `searching`;
-- the most recently displayed text or completed transfer;
-- the last packet's RSSI and SNR; and
-- the button legend.
+| Page | Controls and information |
+| --- | --- |
+| Home | Current mode/profile and node identifier; `HELLO`, `PING`, preset `TEXT`, and `TELEM` actions; selected peer or latest received text |
+| Radio | LoRa/GFSK mode plus the four profiles; every selection opens a confirmation and then uses the synchronized three-second radio-change protocol |
+| Test | One-shot CAD, a 10-packet/64-byte benchmark, a five-packet/64-byte four-profile sweep, Stop, and the latest result |
+| Access | Automatic CAD, 1% duty pacing, synchronized slots, LoRa low-power receive, boosted receive gain, and relay-forwarding toggles |
+| Peers | Four discovered peers per page with RSSI, explicit selection, paging, and automatic-selection reset |
 
-Display lines are clipped to 38 characters. A complete long transfer is printed to the serial monitor, while only a clipped portion is retained for the display. The title remains `N1 LoRa` even while the radio is in GFSK mode.
+Touch input is accepted once per contact, so holding a control does not repeat it. Button hit boxes exactly match the drawn controls. Notices expire after three seconds, active tests refresh once per second, and idle pages refresh every 15 seconds.
+
+Radio mode/profile changes require explicit Apply or Cancel confirmation. Apply sends the same synchronized command used by `mode sync` or `profile sync`; it does not silently change only the local board. The front button can also apply this confirmation. Deliberate changes are persisted on both peers; automated sweep transitions are explicitly transient.
+
+The results view shows mode/profile, sent and received counts, delivery percentage, average round-trip time, RSSI, SNR, application goodput, and local transmit airtime. Full comma-separated reports remain on the serial output.
+
+### Remote Command APIs
+
+Both remote transports accept the same lowercase command strings listed in the Complete Command Map. Commands enter a shared four-entry fixed-size queue and are passed to `handleCommand()` on the main loop, exactly like a completed serial line. This preserves validation, exclusions, state machines, radio behavior, and serial logging in one command implementation.
+
+#### Wi-Fi HTTP API
+
+A board with configured station credentials joins that network. DHCP is the default, or `wifi address <a.a.a.a/8-30>` selects a static local address and Classless Inter-Domain Routing prefix. Static mode configures no gateway or Domain Name System server, so it is intended for clients on the same subnet.
+
+If station credentials are absent or the initial 12-second association fails, the board starts a non-configurable recovery access point named `Nesso-<node-id>`, with password `nesso-lora` and address `http://192.168.4.1`. After a later station disconnect, the recovery access point appears after 30 seconds and is removed if the station reconnects.
+
+| Method and path | Behavior |
+| --- | --- |
+| `POST /command` | Queue the raw `text/plain` request body as one command |
+| `GET /command?command=<url-encoded-command>` | Convenience form for short commands |
+| `GET /status` | Return current node, peer, radio, test, transport, queue, and last-command state as JSON |
+| `GET /` | Return a small endpoint description |
+
+Example from PowerShell using the board's active station or recovery address:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://192.168.4.1/command -ContentType text/plain -Body 'profile sync robust'
+```
+
+Accepted commands receive HTTP status `202` and `{"status":"queued"}`. Empty commands receive `400`; commands longer than 1,232 bytes receive `413`; a full or unavailable queue receives `503`. HTTP acceptance means queued, not that the radio action ultimately succeeded.
+
+#### Bluetooth Low Energy API
+
+The Bluetooth Low Energy device name is also `Nesso-<node-id>`.
+
+| Purpose | Generic Attribute Profile UUID | Property |
+| --- | --- | --- |
+| Service | `7bbf0001-6ba5-4e35-9f1f-8d36a7f34c01` | Service |
+| Command | `7bbf0002-6ba5-4e35-9f1f-8d36a7f34c01` | Write and write without response |
+| Ingress status | `7bbf0003-6ba5-4e35-9f1f-8d36a7f34c01` | Read |
+
+An ordinary characteristic write is one command. The installed Bluetooth stack limits an attribute to 512 bytes. Longer commands, including a maximum-size transfer, use an application-level assembly sequence with chunks no larger than 506 bytes:
+
+```text
+@begin:<total-command-length>
+@data:<first-command-chunk>
+@data:<next-command-chunk>
+@end
+```
+
+`@cancel` discards the partial command. The readable ingress-status characteristic reports `ready`, `chunk_ready`, `chunk:<received>/<expected>`, validation errors, `queued`, or `queue_full`.
+
+#### Remote API Boundaries
+
+The initial APIs intentionally duplicate command ingress, not the complete serial output stream. Detailed reports still print to serial; HTTP provides `/status`, BLE provides ingress status, and the touchscreen exposes common live state and benchmark results.
+
+The recovery access-point password is fixed in source, and the Bluetooth Low Energy service is unpaired and unencrypted. Station link protection depends on the configured network. There is no user authorization, per-command permission model, replay protection, or application encryption. These interfaces are appropriate only for a controlled laboratory. Anyone who reaches HTTP or Bluetooth can invoke every command, including radio changes and deep sleep.
+
+### Persistent Configuration
+
+The sketch stores one versioned fixed-size configuration blob in the ESP32 Non-Volatile Storage partition. It constructs a zero-initialized current blob and compares it byte-for-byte with the last loaded or written blob. `putBytes()` is called only when a successful setting change produces different bytes, limiting flash wear.
+
+The following commands use the same serial, HTTP, and Bluetooth command path:
+
+| Command | Behavior |
+| --- | --- |
+| `config` | Print storage, Wi-Fi, Bluetooth, and radio configuration with the password masked |
+| `config defaults` | Restore and persist all defaults; reject while a long exercise is active |
+| `config restart` | Restart and apply pending Wi-Fi or Bluetooth identity changes |
+| `wifi ssid <name>` | Store a 1-to-32-byte station SSID |
+| `wifi password <value>` | Store an 8-to-63-byte station password |
+| `wifi password open` | Select an open station network |
+| `wifi address dhcp` | Restore station DHCP |
+| `wifi address <a.a.a.a/8-30>` | Store a valid unicast station address and CIDR prefix |
+| `wifi clear` | Clear station credentials; the next boot uses the fixed recovery access point |
+| `ble name <name>` | Store a 1-to-24-byte Bluetooth Low Energy device name |
+
+Wi-Fi credentials/address and the Bluetooth name take effect after restart. LoRa mode/profile, cyclic redundancy check, header, in-phase/quadrature, low-data-rate optimization, whitening, automatic channel detection, duty limiting, low-power receive, receive gain, and relay state apply immediately and persist after successful application. Slotted access, slot epoch, peers, counters, exercises, transfers, results, and relay history remain volatile.
+
+Normal sketch uploads preserve Non-Volatile Storage because erase-all is disabled in the workspace board options. Enabling **Erase All Flash Before Sketch Upload**, changing to an incompatible partition layout, or issuing `config defaults` removes or replaces saved values. This build does not enable Non-Volatile Storage encryption, so the stored Wi-Fi password remains plaintext in flash.
 
 ## Complete Command Map
 
@@ -340,6 +427,15 @@ Display lines are clipped to 38 characters. A complete long transfer is printed 
 | `transfer cancel` | Discard the outgoing transfer |
 | `relay on` or `relay off` | Enable or disable forwarding of received relay packets |
 | `relay send <node-id-or-*> <1-8 hops> <text>` | Broadcast a bounded relay message toward a node or all nodes |
+| `config` | Print persistent and active configuration with the password masked |
+| `config defaults` | Restore and persist defaults |
+| `config restart` | Restart to apply pending Wi-Fi/Bluetooth changes |
+| `wifi ssid <name>` | Store station SSID |
+| `wifi password <value-or-open>` | Store station password or select an open network |
+| `wifi address dhcp` | Select station DHCP |
+| `wifi address <a.a.a.a/8-30>` | Store a static station address and CIDR prefix |
+| `wifi clear` | Clear station credentials and return to recovery AP on restart |
+| `ble name <name>` | Store the Bluetooth Low Energy device name |
 
 ## Custom Packet Protocol
 
@@ -372,7 +468,7 @@ The packet types are:
 | `S` | Telemetry | `up=<seconds>;vbat=<volts>;charge=<percent>;heap=<bytes>` |
 | `B` | Benchmark request | Session, sample index, local send time, and generated padding |
 | `b` | Benchmark reply | Exact echo of the benchmark request body |
-| `M` | Delayed radio change | Mode code, zero-based profile index, and delay in milliseconds |
+| `M` | Delayed radio change | Mode code, zero-based profile index, delay in milliseconds, and persistence flag |
 | `F` | Transfer fragment | Transfer identifier, fragment index, count, 16-bit checksum, and data |
 | `K` | Transfer acknowledgement | Transfer identifier and received-fragment bitmap |
 | `L` | Relayed text | Message identifier, original source, final destination, remaining hops, and text |
@@ -488,7 +584,7 @@ up=<uptime-seconds>;vbat=<voltage>;charge=<percent>;heap=<free-bytes>
 Telemetry is sent:
 
 - by `s`;
-- by Button B; and
+- by the Home page `TELEM` control; and
 - periodically, first after 15 to almost 30 seconds and then every 60 to almost 75 seconds.
 
 Periodic discovery and telemetry pause during benchmarks, sweeps, delayed radio changes, and outgoing transfers. Manually requested traffic is still subject to the shared access controls.
@@ -673,10 +769,11 @@ Use a longer preamble and controlled traffic when exploring receive duty cycling
 `sleep <seconds>` accepts a positive duration. It:
 
 1. prints and flushes the serial message;
-2. puts the SX1262 to sleep;
-3. clears the display;
-4. configures the ESP32-C6 timer wakeup; and
-5. enters deep sleep.
+2. stops the HTTP server, Wi-Fi access point, and Bluetooth Low Energy stack;
+3. puts the SX1262 to sleep;
+4. clears the display;
+5. configures the ESP32-C6 timer wakeup; and
+6. enters deep sleep.
 
 Wakeup restarts the sketch from startup. Volatile state is lost, including peer records, counters, profile changes, pending text, transfers, relay history, and access-control settings. The node sends a new startup `HELLO` when the radio is ready.
 
@@ -917,7 +1014,7 @@ After a record expires or is overwritten, a delayed duplicate could be forwarded
 
 ## Feature Interaction and Concurrency
 
-The main loop checks radio reception, serial input, buttons, deferred replies, text retries, benchmark state, pending radio changes, sweep state, transfer state, incoming-transfer expiry, and periodic traffic approximately every two milliseconds when no blocking operation is active.
+The main loop checks radio reception, serial input, queued HTTP/Bluetooth commands, the HTTP server, touch, the front button, deferred replies, text retries, benchmark state, pending radio changes, sweep state, transfer state, incoming-transfer expiry, and periodic traffic approximately every two milliseconds when no blocking operation is active.
 
 Some combinations are rejected in code:
 
@@ -974,6 +1071,10 @@ Other commands are not universally locked. Local mode/profile changes, packet-op
 | Relay history | 16 records retained for 2 minutes |
 | Button debounce | 250 milliseconds |
 | Implicit LoRa packet length | 24 through 220 bytes |
+| Remote command length | 1 through 1,232 bytes |
+| Remote command queue | 4 complete commands |
+| Bluetooth direct write | At most 512 bytes |
+| Bluetooth assembled data chunk | At most 506 bytes after the `@data:` prefix |
 
 ## Suggested Exercises
 
@@ -1106,23 +1207,39 @@ Keep tests small. Relaying has no routing or congestion control.
 5. Use `diag calibrate` after selecting the intended frequency profile.
 6. Enter `sleep 10` and observe a full restart, a reset peer table, and a new startup `HELLO` after wake.
 
+### 13. Disconnected and Remote Operation
+
+1. Disconnect the USB data connection after programming and power both boards from their batteries.
+2. Use Home on one board to send `HELLO`, ping, preset text, and telemetry.
+3. Use Radio to synchronize `robust`, then Test to run a benchmark and inspect its on-screen result.
+4. Join the fixed `Nesso-<node-id>` recovery network with password `nesso-lora`, then set station credentials with `wifi ssid`, `wifi password`, and `config restart`.
+5. Reconnect through the station address and POST `p`, `s`, and `profile sync default` to `/command`, checking `/status` between commands.
+6. Connect with a Bluetooth Low Energy Generic Attribute Profile client, write `peers` to the command characteristic, and read the ingress-status characteristic.
+7. Test chunk assembly with a long `transfer` command.
+8. Confirm that the same validation and radio behavior occurs through serial, HTTP, and Bluetooth Low Energy.
+
 ## Glossary
 
 | Term | Meaning in this project |
 | --- | --- |
+| API | Application Programming Interface; HTTP and Bluetooth command ingress in this sketch |
 | ACK | Acknowledgement, a reply confirming receipt of specific data |
 | Airtime | Time for which a complete packet occupies the radio channel |
 | Bandwidth | Width of the configured radio channel |
+| BLE | Bluetooth Low Energy, the Generic Attribute Profile command transport |
 | CAD | Channel Activity Detection, the SX1262's search for a compatible LoRa preamble |
+| CIDR | Classless Inter-Domain Routing; slash-prefix notation for the static station subnet |
 | CR | Coding Rate, the ratio controlling forward-error-correction redundancy |
 | CRC | Cyclic Redundancy Check, an error-detecting checksum |
 | CSV | Comma-Separated Values, the machine-readable text format used for reports |
 | dB | Decibel, a logarithmic ratio unit |
 | dBm | Decibels relative to one milliwatt, an absolute power unit |
 | Duty cycle | Fraction of an observation interval occupied by transmission |
+| DHCP | Dynamic Host Configuration Protocol, used for automatic station addressing |
 | ESP32-C6 | The microcontroller used by the Nesso N1 |
 | GFSK | Gaussian Frequency-Shift Keying, filtered digital frequency modulation |
 | GPIO | General-Purpose Input/Output, a controllable digital hardware signal |
+| HTTP | Hypertext Transfer Protocol, the Wi-Fi command transport |
 | I/Q | In-phase and Quadrature, orthogonal complex baseband signal components |
 | I2C | Inter-Integrated Circuit, a two-wire peripheral bus |
 | IRQ | Interrupt Request, a hardware indication that an event needs service |
@@ -1134,6 +1251,7 @@ Keep tests small. Relaying has no routing or congestion control.
 | LoRaWAN | Long Range Wide Area Network, a network protocol built on LoRa but not implemented here |
 | MAC address | Media Access Control address; hardware-derived input to the node identifier |
 | N1L | This sketch's custom packet-protocol marker; it is not an industry-standard acronym |
+| NVS | Non-Volatile Storage, the ESP32 flash-backed key/value store used for configuration |
 | Peer | Another exerciser node heard over the radio |
 | Physical layer | The modulation, coding, framing, and radio behavior that put bits on air |
 | Preamble | Known symbols or bits that let a receiver detect and synchronize to a packet |
@@ -1155,7 +1273,7 @@ Keep tests small. Relaying has no routing or congestion control.
 
 To keep observations visible and the sketch self-contained, it does not provide:
 
-- encryption, authentication, or secure key management;
+- LoRa application encryption, remote API authorization, or secure key management;
 - LoRaWAN compatibility;
 - guaranteed unique node identifiers;
 - routing-table discovery or optimal path selection;
@@ -1163,7 +1281,7 @@ To keep observations visible and the sketch self-contained, it does not provide:
 - congestion control or quality-of-service classes;
 - automatic regional frequency plans or compliance enforcement;
 - synchronized wall clocks;
-- persistent state across reset or deep sleep;
+- persistent peers, counters, exercises, transfers, results, or relay history across reset or deep sleep;
 - simultaneous reception of several frequencies, spreading factors, or modes; or
 - calibrated spectrum, power, current, or bit-error-rate instrumentation.
 

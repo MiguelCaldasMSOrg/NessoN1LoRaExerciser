@@ -14,7 +14,10 @@ See [FEATURES.md](FEATURES.md) for a complete introduction to LoRa and GFSK conc
 - Battery, uptime, charge, and free-heap telemetry
 - RSSI and SNR reporting for received packets
 - LoRa channel-activity detection
-- Serial, button, and onboard display interaction
+- Touchscreen operation with five action-oriented pages and live results
+- Front-button shortcuts without requiring a serial connection
+- Wi-Fi HTTP and Bluetooth Low Energy command APIs
+- Persistent Wi-Fi, Bluetooth, LoRa, packet, and access configuration in NVS
 - Runtime LoRa profiles and synchronized peer switching
 - GFSK modulation with synchronized LoRa/GFSK changes
 - Link benchmarks and automated profile sweeps with CSV results
@@ -33,7 +36,7 @@ See [FEATURES.md](FEATURES.md) for a complete introduction to LoRa and GFSK conc
 - An Arduino-compatible development environment with the Espressif ESP32 board platform
 - [RadioLib](https://github.com/jgromes/RadioLib)
 - [Arduino_Nesso_N1](https://github.com/arduino-libraries/Arduino_Nesso_N1)
-- USB data cables for programming and serial monitoring
+- USB data cables for programming; serial monitoring is optional after upload
 
 The repository automation currently verifies the following versions:
 
@@ -53,7 +56,7 @@ Compatible later versions may also work.
 3. Review the LoRa profile near the top of the sketch. Both boards must use identical settings.
 4. Select the Nesso N1 board and the appropriate serial port.
 5. Upload the sketch to both boards.
-6. Open each serial monitor at 115200 baud with newline enabled.
+6. Use the touchscreen, front button, Wi-Fi API, Bluetooth Low Energy API, or an optional serial monitor at 115200 baud with newline enabled.
 
 Each board displays its eight-character node ID and periodically broadcasts discovery packets. Once another node is heard, its ID appears as the peer.
 
@@ -93,7 +96,8 @@ The Arduino extension writes reusable build output to the sibling directory `../
 - Automatic peer selection returns to broadcast after three minutes without hearing the selected peer. An explicitly selected peer remains locked.
 - Protocol replies blocked by access controls enter a four-packet deferred queue and are retried up to ten times.
 - Benchmarks, sweeps, transfers, and pending radio changes are kept mutually exclusive to avoid contaminating measurements or state.
-- Automatic CAD, duty-percentage throttling, slotted access, low-power receive, boosted gain, and relay forwarding are disabled at startup.
+- Wi-Fi, Bluetooth, LoRa mode/profile, packet options, CAD, duty limiting, low-power receive, receive gain, and relay settings are restored from nonvolatile storage when available.
+- A board with station credentials joins that Wi-Fi network. If association fails, it starts the fixed recovery access point `Nesso-<node-id>` at `192.168.4.1/24` with password `nesso-lora`.
 
 ## Controls
 
@@ -107,8 +111,22 @@ The Arduino extension writes reusable build output to the sibling directory `../
 | `s` | Print local status and send telemetry |
 | `c` | Run LoRa channel-activity detection |
 | `?` or `help` | Print command help |
-| `KEY1` | Send a text message |
-| `KEY2` | Send telemetry |
+| Front `KEY1` | Ping on Home, confirm a pending radio change, or return Home |
+| Side `KEY2` | Intentionally unused |
+
+### Touchscreen Controls
+
+The bottom navigation bar provides five pages:
+
+| Page | Actions |
+| --- | --- |
+| Home | Send `HELLO`, ping, preset acknowledged text, or telemetry |
+| Radio | Synchronize LoRa/GFSK mode and any of the four profiles after confirmation |
+| Test | Run CAD, a 10-packet benchmark, a five-packet profile sweep, stop a test, or inspect results |
+| Access | Toggle automatic CAD, 1% duty pacing, synchronized slots, low-power receive, boosted gain, and relay forwarding |
+| Peers | Browse discovered nodes, lock selection to a peer, or return to automatic selection |
+
+Radio changes require an on-screen confirmation. The front button confirms that dialog, pings from Home, and otherwise returns to Home. The side button is not used.
 
 ### Radio And Packet Controls
 
@@ -176,6 +194,78 @@ Benchmark output includes send attempts, send failures, delivered replies, deliv
 | `relay send <node-id\|*> <1-8 hops> <text>` | Send a bounded broadcast relay message |
 
 Transfers use up to 16 fragments of 72 bytes, a CRC-16 over the complete text, selective acknowledgement bitmaps, five automatic transmission rounds, and a 30-second receiver timeout. Relay nodes remember 16 message IDs for two minutes to suppress duplicates and loops.
+
+### Persistent Configuration
+
+These commands work identically over serial, HTTP, and Bluetooth Low Energy:
+
+| Command | Action |
+| --- | --- |
+| `config` | Print persisted and active configuration without revealing the Wi-Fi password |
+| `config defaults` | Restore Wi-Fi, Bluetooth, LoRa, packet, and access defaults |
+| `config restart` | Restart and apply pending Wi-Fi/Bluetooth identity changes |
+| `wifi ssid <name>` | Store a station network name of 1 to 32 bytes |
+| `wifi password <value>` | Store a station password of 8 to 63 bytes |
+| `wifi password open` | Select an open station network |
+| `wifi address dhcp` | Obtain the station address through DHCP |
+| `wifi address <a.a.a.a/8-30>` | Store a static station address and CIDR prefix |
+| `wifi clear` | Clear station credentials and use the fixed recovery AP after restart |
+| `ble name <name>` | Store a Bluetooth Low Energy name of 1 to 24 bytes |
+
+Wi-Fi and Bluetooth identity changes take effect after restart. Static station mode configures the local address and subnet only, with no default gateway or DNS server; it is intended for control from the same subnet. LoRa and access changes take effect immediately and are saved after successful application. Automated sweep profile changes remain transient.
+
+The versioned configuration blob is stored in the ESP32 Non-Volatile Storage partition. A byte-for-byte comparison prevents writes when nothing changed. Normal sketch uploads preserve it; enabling **Erase All Flash Before Sketch Upload** clears it. The selected build does not encrypt Non-Volatile Storage, so Wi-Fi credentials are stored in plaintext flash.
+
+## Remote Command API
+
+The HTTP and Bluetooth Low Energy transports accept the same command strings as the serial monitor. Commands enter a shared four-entry queue and execute through the existing command parser on the main loop. Serial output remains available for detailed command results; `GET /status` and the touchscreen expose current state.
+
+### Wi-Fi HTTP
+
+At startup a board with configured station credentials attempts to join that network for 12 seconds. DHCP is the default; a configured CIDR address is used instead when selected. If credentials are absent or association fails, the board creates this non-configurable recovery network:
+
+| Setting | Value |
+| --- | --- |
+| Network name | `Nesso-<node-id>` |
+| Password | `nesso-lora` |
+| Address | `http://192.168.4.1` |
+
+After a later station disconnect, the recovery AP starts after 30 seconds. It is removed if the station reconnects. The HTTP service is available on the station address or recovery address, whichever is active.
+
+Send a command as the raw body of an HTTP POST:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://192.168.4.1/command -ContentType text/plain -Body 'benchmark 10 64'
+```
+
+For short commands, `GET /command?command=p` is also accepted. URL-encode spaces when using GET. `GET /status` returns JSON containing node, radio, peer, exercise, transport, queue, and last-command state.
+
+The command endpoint returns HTTP `202` with `{"status":"queued"}` when accepted. Empty, oversized, and queue-full commands return `400`, `413`, and `503` respectively.
+
+### Bluetooth Low Energy
+
+Connect to the `Nesso-<node-id>` device and use these custom Generic Attribute Profile UUIDs:
+
+| Purpose | UUID | Property |
+| --- | --- | --- |
+| Service | `7bbf0001-6ba5-4e35-9f1f-8d36a7f34c01` | Service |
+| Command | `7bbf0002-6ba5-4e35-9f1f-8d36a7f34c01` | Write or write without response |
+| Ingress status | `7bbf0003-6ba5-4e35-9f1f-8d36a7f34c01` | Read |
+
+Write an ordinary command directly to the command characteristic. Bluetooth Low Energy attributes are limited to 512 bytes in the installed stack. To send a longer command, use this sequence with data chunks no larger than 506 bytes:
+
+```text
+@begin:<total-command-length>
+@data:<first-command-chunk>
+@data:<next-command-chunk>
+@end
+```
+
+Use `@cancel` to discard an incomplete command. Read the ingress-status characteristic for `ready`, chunk progress, validation errors, or the final queue result.
+
+### Security
+
+This initial laboratory API uses a shared fixed password for the recovery AP and an unpaired, unencrypted Bluetooth Low Energy characteristic. Station security depends on the configured network. The API has no user authorization, application encryption, replay defense, or command allowlist. Operate it only in a controlled environment and change or disable these interfaces before using the sketch around untrusted devices.
 
 ## Default Radio Profile
 

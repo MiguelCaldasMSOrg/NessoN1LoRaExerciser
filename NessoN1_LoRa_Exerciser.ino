@@ -18,6 +18,8 @@
     - RSSI and SNR reporting for received packets
     - LoRa channel-activity detection
     - Serial, button, and onboard display interaction
+    - Touchscreen controls for messaging, radio settings, tests, access, and peers
+    - Wi-Fi HTTP and Bluetooth Low Energy APIs using the serial command parser
     - Runtime LoRa profile selection and synchronized peer switching
     - GFSK modulation with synchronized LoRa/GFSK changes
     - Packet delivery, RTT, throughput, RSSI, SNR, and airtime benchmarks
@@ -128,10 +130,33 @@
           Control forwarding of bounded broadcast relay packets
     relay send <node-id|*> <1-8 hops> <text>
           Send a relayed text message
+    config | config defaults | config restart
+          Show configuration, restore defaults, or restart
+    wifi ssid <name> | wifi password <value|open> | wifi clear
+          Configure or clear persistent Wi-Fi station credentials
+    wifi address dhcp|<a.a.a.a/8-30>
+          Select persistent DHCP or static local-subnet addressing
+    ble name <name>
+          Configure the persistent Bluetooth Low Energy device name
 
   Buttons:
-    KEY1      Send a text message
-    KEY2      Send telemetry
+    KEY1      Ping from Home, confirm a radio change, or return Home
+    KEY2      Unused because the side button is difficult to operate
+
+  Touchscreen:
+    Home      Send HELLO, ping, preset text, or telemetry
+    Radio     Synchronize modulation and LoRa profile changes
+    Test      Run CAD, a benchmark, a profile sweep, or inspect results
+    Access    Toggle CAD, duty pacing, slots, low-power RX, gain, and relay
+    Peers     Select a discovered peer or return to automatic selection
+
+  Remote command API:
+    Wi-Fi     Joins the configured station; falls back to a fixed recovery AP
+    Fallback  Nesso-<node-id>, password nesso-lora, http://192.168.4.1
+    HTTP      POST text/plain commands to /command; GET state from /status
+    BLE       Write commands to 7bbf0002-6ba5-4e35-9f1f-8d36a7f34c01
+              under service 7bbf0001-6ba5-4e35-9f1f-8d36a7f34c01
+    Both transports queue the same strings accepted by the serial monitor.
 
   Runtime behavior:
     - The node ID is eight hexadecimal characters derived from the ESP32
@@ -148,7 +173,11 @@
     - Text, ping, and telemetry use broadcast destination * until a peer is
       known.
     - Automatic CAD, duty-percentage throttling, slotted access, low-power RX,
-      boosted gain, and relay forwarding are disabled at startup.
+      boosted gain, and relay forwarding use their last persisted values.
+    - Wi-Fi, BLE, LoRa, packet, access, gain, and relay settings are restored
+      from NVS. Writes occur only when a stored value actually changes.
+    - If configured Wi-Fi station association fails, the fixed recovery access
+      point starts. Its SSID, password, address, and subnet are not configurable.
     - Protocol replies blocked by access controls enter a four-packet deferred
       queue and are retried up to ten times.
     - Automatic peer selection returns to broadcast after three minutes without
@@ -228,6 +257,13 @@
 #include <RadioLib.h>
 #include <Arduino_Nesso_N1.h>
 #include <esp_sleep.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 // ---------------------------------------------------------------------------
 // LoRa profile - both boards must use exactly the same values.
@@ -258,6 +294,7 @@ constexpr uint8_t MAX_TEXT_ATTEMPTS = 3;
 // LNA, and antenna switch are controlled through the I/O expander.
 SX1262 radio = new Module(LORA_CS, LORA_IRQ, RADIOLIB_NC, LORA_BUSY, SPI);
 NessoDisplay nessoDisplay;
+NessoTouch nessoTouch;
 NessoBattery nessoBattery;
 
 constexpr uint16_t COLOR_BLACK = 0x0000;
@@ -266,6 +303,9 @@ constexpr uint16_t COLOR_CYAN = 0x07FF;
 constexpr uint16_t COLOR_GREEN = 0x07E0;
 constexpr uint16_t COLOR_YELLOW = 0xFFE0;
 constexpr uint16_t COLOR_RED = 0xF800;
+constexpr uint16_t COLOR_BLUE = 0x02DF;
+constexpr uint16_t COLOR_DARK = 0x18E3;
+constexpr uint16_t COLOR_GRAY = 0x7BEF;
 
 // Runtime profiles and fixed-size state keep every experiment available in a
 // single Arduino IDE sketch without requiring generated source files.
@@ -316,6 +356,57 @@ constexpr uint8_t TDMA_SLOT_COUNT = 8;
 constexpr uint32_t TDMA_SLOT_MS = 250;
 constexpr float DEFAULT_DUTY_CYCLE_PERCENT = 1.0f;
 constexpr uint8_t DEFERRED_PACKET_COUNT = 4;
+constexpr size_t REMOTE_COMMAND_MAX_LENGTH = MAX_TRANSFER_LENGTH + 80;
+constexpr uint8_t REMOTE_COMMAND_QUEUE_DEPTH = 4;
+constexpr char FALLBACK_AP_PASSWORD[] = "nesso-lora";
+constexpr uint32_t WIFI_STATION_CONNECT_TIMEOUT_MS = 12000;
+constexpr uint32_t WIFI_FALLBACK_DELAY_MS = 30000;
+constexpr char REMOTE_BLE_SERVICE_UUID[] = "7bbf0001-6ba5-4e35-9f1f-8d36a7f34c01";
+constexpr char REMOTE_BLE_COMMAND_UUID[] = "7bbf0002-6ba5-4e35-9f1f-8d36a7f34c01";
+constexpr char REMOTE_BLE_STATUS_UUID[] = "7bbf0003-6ba5-4e35-9f1f-8d36a7f34c01";
+constexpr char CONFIG_NAMESPACE[] = "nesso-config";
+constexpr char CONFIG_KEY[] = "settings";
+constexpr uint32_t PERSISTENT_CONFIG_MAGIC = 0x4E314346UL;
+constexpr uint16_t PERSISTENT_CONFIG_VERSION = 1;
+
+constexpr uint8_t CONFIG_FLAG_CAD = 1U << 0;
+constexpr uint8_t CONFIG_FLAG_DUTY = 1U << 1;
+constexpr uint8_t CONFIG_FLAG_LOW_POWER = 1U << 2;
+constexpr uint8_t CONFIG_FLAG_RELAY = 1U << 3;
+constexpr uint8_t CONFIG_FLAG_RX_BOOST = 1U << 4;
+constexpr uint8_t CONFIG_FLAG_CRC = 1U << 5;
+constexpr uint8_t CONFIG_FLAG_WHITENING = 1U << 6;
+constexpr uint8_t CONFIG_FLAG_INVERTED_IQ = 1U << 7;
+
+enum class RemoteEnqueueResult : uint8_t {
+  QUEUED,
+  EMPTY,
+  TOO_LONG,
+  FULL
+};
+
+struct RemoteCommand {
+  char value[REMOTE_COMMAND_MAX_LENGTH + 1];
+  char source[8];
+};
+
+struct PersistentConfiguration {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  char wifiSsid[33];
+  char wifiPassword[64];
+  char bleName[25];
+  uint8_t wifiAddress[4];
+  uint8_t wifiPrefixLength;
+  uint8_t wifiStaticAddress;
+  uint8_t radioMode;
+  uint8_t profileIndex;
+  uint8_t flags;
+  int8_t forcedLdro;
+  uint16_t implicitLength;
+  float dutyPercent;
+};
 
 struct PeerInfo {
   String id;
@@ -395,6 +486,7 @@ struct PendingRadioConfiguration {
   RadioMode mode = RadioMode::LORA;
   uint8_t profileIndex = 0;
   uint32_t applyAt = 0;
+  bool persist = true;
 };
 
 enum class SweepPhase : uint8_t {
@@ -414,9 +506,19 @@ struct ProfileSweepState {
   bool returningToDefault = false;
 };
 
+enum class UiPage : uint8_t {
+  HOME,
+  RADIO,
+  TEST,
+  ACCESS,
+  PEERS,
+  RESULTS
+};
+
 volatile bool packetReceivedFlag = false;
 bool radioReady = false;
 bool displayReady = false;
+bool touchReady = false;
 RadioMode radioMode = RadioMode::LORA;
 uint8_t activeProfileIndex = 0;
 bool listenBeforeTalkEnabled = false;
@@ -441,6 +543,46 @@ uint64_t totalTransmitAirtimeUs = 0;
 uint32_t transmitFailures = 0;
 uint32_t accessDeferrals = 0;
 uint32_t cadBusyDetections = 0;
+
+UiPage uiPage = UiPage::HOME;
+bool uiConfirmationActive = false;
+RadioMode uiPendingRadioMode = RadioMode::LORA;
+uint8_t uiPendingProfileIndex = 0;
+String uiNotice;
+uint32_t uiNoticeUntil = 0;
+uint32_t lastUiRefreshAt = 0;
+uint32_t lastTouchPollAt = 0;
+bool previousTouchPressed = false;
+uint8_t uiPeerPage = 0;
+bool benchmarkResultAvailable = false;
+String benchmarkResultReason;
+RadioMode benchmarkResultMode = RadioMode::LORA;
+uint8_t benchmarkResultProfileIndex = 0;
+uint32_t benchmarkResultElapsedMs = 0;
+uint64_t benchmarkResultAirtimeUs = 0;
+QueueHandle_t remoteCommandQueue = nullptr;
+WebServer remoteApiServer(80);
+bool remoteHttpReady = false;
+bool remoteBleReady = false;
+String remoteWifiSsid;
+String remoteWifiPassword;
+String remoteBleDeviceName;
+IPAddress remoteWifiAddress;
+uint8_t remoteWifiPrefixLength = 24;
+bool remoteWifiStaticAddress = false;
+bool remoteWifiFallbackApActive = false;
+bool remoteWifiEverConnected = false;
+uint32_t remoteWifiDisconnectedAt = 0;
+bool transientRadioConfigurationActive = false;
+String lastRemoteCommandSource;
+uint32_t lastRemoteCommandAt = 0;
+BLECharacteristic* remoteBleStatusCharacteristic = nullptr;
+String remoteBleCommandAssembly;
+size_t remoteBleExpectedLength = 0;
+bool remoteBleAssemblyActive = false;
+PersistentConfiguration persistedConfiguration = {};
+bool persistedConfigurationAvailable = false;
+bool persistedConfigurationStored = false;
 
 PeerInfo peers[MAX_PEERS];
 BenchmarkState benchmark;
@@ -478,7 +620,6 @@ float lastReceivedRssi = 0.0f;
 float lastReceivedSnr = 0.0f;
 uint32_t lastButtonEvent = 0;
 bool previousKey1Pressed = false;
-bool previousKey2Pressed = false;
 
 struct ReceivedPacket {
   char type = 0;
@@ -504,6 +645,558 @@ const char* radioModeName() {
   return radioMode == RadioMode::LORA ? "LoRa" : "GFSK";
 }
 
+PersistentConfiguration defaultPersistentConfiguration() {
+  PersistentConfiguration configuration = {};
+  configuration.magic = PERSISTENT_CONFIG_MAGIC;
+  configuration.version = PERSISTENT_CONFIG_VERSION;
+  configuration.size = sizeof(PersistentConfiguration);
+  configuration.wifiSsid[0] = '\0';
+  configuration.wifiPassword[0] = '\0';
+  snprintf(configuration.bleName, sizeof(configuration.bleName), "Nesso-%s", nodeId);
+  const uint8_t defaultAddress[] = { 192, 168, 1, 100 };
+  memcpy(configuration.wifiAddress, defaultAddress, sizeof(configuration.wifiAddress));
+  configuration.wifiPrefixLength = 24;
+  configuration.wifiStaticAddress = 0;
+  configuration.radioMode = static_cast<uint8_t>(RadioMode::LORA);
+  configuration.profileIndex = 0;
+  configuration.flags = CONFIG_FLAG_CRC | CONFIG_FLAG_WHITENING;
+  configuration.forcedLdro = -1;
+  configuration.implicitLength = 0;
+  configuration.dutyPercent = DEFAULT_DUTY_CYCLE_PERCENT;
+  return configuration;
+}
+
+PersistentConfiguration currentPersistentConfiguration() {
+  PersistentConfiguration configuration = {};
+  configuration.magic = PERSISTENT_CONFIG_MAGIC;
+  configuration.version = PERSISTENT_CONFIG_VERSION;
+  configuration.size = sizeof(PersistentConfiguration);
+  snprintf(configuration.wifiSsid, sizeof(configuration.wifiSsid), "%s", remoteWifiSsid.c_str());
+  snprintf(configuration.wifiPassword, sizeof(configuration.wifiPassword), "%s", remoteWifiPassword.c_str());
+  snprintf(configuration.bleName, sizeof(configuration.bleName), "%s", remoteBleDeviceName.c_str());
+  for (uint8_t index = 0; index < 4; ++index) {
+    configuration.wifiAddress[index] = remoteWifiAddress[index];
+  }
+  configuration.wifiPrefixLength = remoteWifiPrefixLength;
+  configuration.wifiStaticAddress = remoteWifiStaticAddress ? 1 : 0;
+  configuration.radioMode = transientRadioConfigurationActive && persistedConfigurationAvailable ? persistedConfiguration.radioMode : static_cast<uint8_t>(radioMode);
+  configuration.profileIndex = transientRadioConfigurationActive && persistedConfigurationAvailable ? persistedConfiguration.profileIndex : activeProfileIndex;
+  configuration.flags = 0;
+  configuration.flags |= listenBeforeTalkEnabled ? CONFIG_FLAG_CAD : 0;
+  configuration.flags |= dutyCycleLimitEnabled ? CONFIG_FLAG_DUTY : 0;
+  configuration.flags |= lowPowerReceiveEnabled ? CONFIG_FLAG_LOW_POWER : 0;
+  configuration.flags |= relayEnabled ? CONFIG_FLAG_RELAY : 0;
+  configuration.flags |= receiveBoostedGainEnabled ? CONFIG_FLAG_RX_BOOST : 0;
+  configuration.flags |= packetCrcEnabled ? CONFIG_FLAG_CRC : 0;
+  configuration.flags |= fskWhiteningEnabled ? CONFIG_FLAG_WHITENING : 0;
+  configuration.flags |= invertedIqEnabled ? CONFIG_FLAG_INVERTED_IQ : 0;
+  configuration.forcedLdro = forcedLdroState;
+  configuration.implicitLength = static_cast<uint16_t>(implicitPacketLength);
+  configuration.dutyPercent = dutyCyclePercent;
+  return configuration;
+}
+
+size_t boundedStringLength(const char* value, size_t maximumLength) {
+  size_t length = 0;
+  while (length < maximumLength && value[length] != '\0') {
+    ++length;
+  }
+  return length;
+}
+
+bool persistentConfigurationIsValid(const PersistentConfiguration& configuration) {
+  if (configuration.magic != PERSISTENT_CONFIG_MAGIC || configuration.version != PERSISTENT_CONFIG_VERSION || configuration.size != sizeof(PersistentConfiguration)) {
+    return false;
+  }
+  if (memchr(configuration.wifiSsid, '\0', sizeof(configuration.wifiSsid)) == nullptr || memchr(configuration.wifiPassword, '\0', sizeof(configuration.wifiPassword)) == nullptr || memchr(configuration.bleName, '\0', sizeof(configuration.bleName)) == nullptr) {
+    return false;
+  }
+
+  const size_t ssidLength = boundedStringLength(configuration.wifiSsid, sizeof(configuration.wifiSsid));
+  const size_t passwordLength = boundedStringLength(configuration.wifiPassword, sizeof(configuration.wifiPassword));
+  const size_t bleNameLength = boundedStringLength(configuration.bleName, sizeof(configuration.bleName));
+  const bool implicitLengthValid = configuration.implicitLength == 0 || (configuration.implicitLength >= 24 && configuration.implicitLength <= MAX_PACKET_LENGTH);
+  const IPAddress address(configuration.wifiAddress[0], configuration.wifiAddress[1], configuration.wifiAddress[2], configuration.wifiAddress[3]);
+  const bool credentialsValid = passwordLength == 0 || (passwordLength >= 8 && passwordLength <= 63);
+  const bool addressValid = configuration.wifiStaticAddress == 0 || (configuration.wifiPrefixLength >= 1 && configuration.wifiPrefixLength <= 30 && configuration.wifiAddress[0] > 0 && configuration.wifiAddress[0] < 224 && static_cast<uint32_t>(address) != 0);
+  return ssidLength <= 32 && credentialsValid && bleNameLength >= 1 && bleNameLength <= 24 && configuration.wifiStaticAddress <= 1 && addressValid && configuration.radioMode <= static_cast<uint8_t>(RadioMode::FSK) && configuration.profileIndex < LORA_PROFILE_COUNT && configuration.forcedLdro >= -1 && configuration.forcedLdro <= 1 && implicitLengthValid && isfinite(configuration.dutyPercent) && configuration.dutyPercent > 0.0f && configuration.dutyPercent <= 100.0f;
+}
+
+void applyPersistentConfiguration(const PersistentConfiguration& configuration) {
+  remoteWifiSsid = configuration.wifiSsid;
+  remoteWifiPassword = configuration.wifiPassword;
+  remoteBleDeviceName = configuration.bleName;
+  remoteWifiAddress = IPAddress(configuration.wifiAddress[0], configuration.wifiAddress[1], configuration.wifiAddress[2], configuration.wifiAddress[3]);
+  remoteWifiPrefixLength = configuration.wifiPrefixLength;
+  remoteWifiStaticAddress = configuration.wifiStaticAddress != 0;
+  transientRadioConfigurationActive = false;
+  radioMode = static_cast<RadioMode>(configuration.radioMode);
+  activeProfileIndex = configuration.profileIndex;
+  listenBeforeTalkEnabled = configuration.flags & CONFIG_FLAG_CAD;
+  dutyCycleLimitEnabled = configuration.flags & CONFIG_FLAG_DUTY;
+  lowPowerReceiveEnabled = configuration.flags & CONFIG_FLAG_LOW_POWER;
+  relayEnabled = configuration.flags & CONFIG_FLAG_RELAY;
+  receiveBoostedGainEnabled = configuration.flags & CONFIG_FLAG_RX_BOOST;
+  packetCrcEnabled = configuration.flags & CONFIG_FLAG_CRC;
+  fskWhiteningEnabled = configuration.flags & CONFIG_FLAG_WHITENING;
+  invertedIqEnabled = configuration.flags & CONFIG_FLAG_INVERTED_IQ;
+  forcedLdroState = configuration.forcedLdro;
+  implicitPacketLength = configuration.implicitLength;
+  dutyCyclePercent = configuration.dutyPercent;
+}
+
+bool loadPersistentConfiguration() {
+  const PersistentConfiguration defaults = defaultPersistentConfiguration();
+  applyPersistentConfiguration(defaults);
+  persistedConfiguration = defaults;
+  persistedConfigurationAvailable = true;
+  persistedConfigurationStored = false;
+
+  Preferences preferences;
+  if (!preferences.begin(CONFIG_NAMESPACE, true)) {
+    Serial.println(F("[Config] NVS unavailable; using defaults"));
+    return false;
+  }
+
+  PersistentConfiguration stored = {};
+  const size_t storedLength = preferences.getBytesLength(CONFIG_KEY);
+  const size_t readLength = storedLength == sizeof(stored) ? preferences.getBytes(CONFIG_KEY, &stored, sizeof(stored)) : 0;
+  preferences.end();
+  if (readLength != sizeof(stored) || !persistentConfigurationIsValid(stored)) {
+    Serial.println(F("[Config] no valid stored configuration; using defaults"));
+    return false;
+  }
+
+  applyPersistentConfiguration(stored);
+  persistedConfiguration = stored;
+  persistedConfigurationAvailable = true;
+  persistedConfigurationStored = true;
+  Serial.println(F("[Config] restored stored configuration"));
+  return true;
+}
+
+bool savePersistentConfigurationIfChanged() {
+  const PersistentConfiguration current = currentPersistentConfiguration();
+  if (persistedConfigurationAvailable && memcmp(&current, &persistedConfiguration, sizeof(current)) == 0) {
+    return false;
+  }
+
+  Preferences preferences;
+  if (!preferences.begin(CONFIG_NAMESPACE, false)) {
+    Serial.println(F("[Config] could not open NVS for writing"));
+    return false;
+  }
+  const size_t written = preferences.putBytes(CONFIG_KEY, &current, sizeof(current));
+  preferences.end();
+  if (written != sizeof(current)) {
+    Serial.println(F("[Config] failed to store configuration"));
+    return false;
+  }
+
+  persistedConfiguration = current;
+  persistedConfigurationAvailable = true;
+  persistedConfigurationStored = true;
+  Serial.println(F("[Config] stored changed configuration"));
+  return true;
+}
+
+bool parseWifiCidr(const String& value, IPAddress& address, uint8_t& prefixLength) {
+  const int separator = value.lastIndexOf('/');
+  if (separator <= 0 || separator >= static_cast<int>(value.length()) - 1) {
+    return false;
+  }
+
+  const String addressText = value.substring(0, separator);
+  const String prefixText = value.substring(separator + 1);
+  const char* prefixStart = prefixText.c_str();
+  char* prefixEnd = nullptr;
+  const long parsedPrefix = strtol(prefixStart, &prefixEnd, 10);
+  IPAddress parsedAddress;
+  if (!parsedAddress.fromString(addressText) || prefixEnd == prefixStart || *prefixEnd != '\0' || parsedPrefix < 8 || parsedPrefix > 30 || parsedAddress[0] == 0 || parsedAddress[0] >= 224) {
+    return false;
+  }
+
+  const IPAddress subnet = subnetMaskFromPrefix(static_cast<uint8_t>(parsedPrefix));
+  bool networkAddress = true;
+  bool broadcastAddress = true;
+  for (uint8_t index = 0; index < 4; ++index) {
+    networkAddress &= (parsedAddress[index] & static_cast<uint8_t>(~subnet[index])) == 0;
+    broadcastAddress &= (parsedAddress[index] & static_cast<uint8_t>(~subnet[index])) == static_cast<uint8_t>(~subnet[index]);
+  }
+  if (networkAddress || broadcastAddress) {
+    return false;
+  }
+
+  address = parsedAddress;
+  prefixLength = static_cast<uint8_t>(parsedPrefix);
+  return true;
+}
+
+void printPersistentConfiguration() {
+  Serial.println(F("--- Persistent configuration ---"));
+  Serial.print(F("Storage:       "));
+  Serial.println(persistedConfigurationStored ? "NVS" : "defaults (not written)" );
+  Serial.print(F("Wi-Fi SSID:    "));
+  Serial.println(remoteWifiSsid.length() ? remoteWifiSsid : "(unset; recovery AP on boot)");
+  Serial.print(F("Wi-Fi secret:  "));
+  Serial.println(remoteWifiPassword.length() ? "(set)" : (remoteWifiSsid.length() ? "(open network)" : "(unset)"));
+  Serial.print(F("Wi-Fi address: "));
+  if (remoteWifiStaticAddress) {
+    Serial.print(remoteWifiAddress);
+    Serial.print('/');
+    Serial.println(remoteWifiPrefixLength);
+  } else {
+    Serial.println(F("DHCP"));
+  }
+  Serial.print(F("Wi-Fi active:  "));
+  Serial.print(remoteWifiFallbackApActive ? "recovery AP, " : "station, ");
+  Serial.println(remoteWifiFallbackApActive ? WiFi.softAPIP() : WiFi.localIP());
+  Serial.print(F("BLE name:      "));
+  Serial.println(remoteBleDeviceName);
+  Serial.print(F("Radio:         "));
+  Serial.print(radioModeName());
+  Serial.print(F(" / "));
+  Serial.println(activeLoRaProfile().name);
+  Serial.println(F("Wi-Fi and BLE identity changes take effect after restart."));
+  Serial.println(F("--------------------------------"));
+}
+
+RemoteEnqueueResult enqueueRemoteCommand(const String& rawCommand, const char* source) {
+  String command = rawCommand;
+  command.trim();
+  if (!command.length()) {
+    return RemoteEnqueueResult::EMPTY;
+  }
+  if (command.length() > REMOTE_COMMAND_MAX_LENGTH) {
+    return RemoteEnqueueResult::TOO_LONG;
+  }
+  if (remoteCommandQueue == nullptr) {
+    return RemoteEnqueueResult::FULL;
+  }
+
+  RemoteCommand queued = {};
+  memcpy(queued.value, command.c_str(), command.length());
+  queued.value[command.length()] = '\0';
+  snprintf(queued.source, sizeof(queued.source), "%s", source);
+  return xQueueSend(remoteCommandQueue, &queued, 0) == pdPASS ? RemoteEnqueueResult::QUEUED : RemoteEnqueueResult::FULL;
+}
+
+const char* remoteEnqueueResultName(RemoteEnqueueResult result) {
+  switch (result) {
+    case RemoteEnqueueResult::QUEUED:
+      return "queued";
+    case RemoteEnqueueResult::EMPTY:
+      return "empty";
+    case RemoteEnqueueResult::TOO_LONG:
+      return "too_long";
+    case RemoteEnqueueResult::FULL:
+      return "queue_full";
+  }
+  return "unknown";
+}
+
+void appendJsonEscaped(String& output, const String& value) {
+  for (size_t index = 0; index < value.length(); ++index) {
+    const char character = value.charAt(index);
+    if (character == '"' || character == '\\') {
+      output += '\\';
+      output += character;
+    } else if (character == '\b') {
+      output += F("\\b");
+    } else if (character == '\f') {
+      output += F("\\f");
+    } else if (character == '\n') {
+      output += F("\\n");
+    } else if (character == '\r') {
+      output += F("\\r");
+    } else if (character == '\t') {
+      output += F("\\t");
+    } else if (static_cast<uint8_t>(character) < 0x20) {
+      char escape[7];
+      snprintf(escape, sizeof(escape), "\\u%04X", static_cast<uint8_t>(character));
+      output += escape;
+    } else {
+      output += character;
+    }
+  }
+}
+
+String remoteStatusJson() {
+  String json;
+  json.reserve(420);
+  json += F("{\"node\":\"");
+  json += nodeId;
+  json += F("\",\"mode\":\"");
+  json += radioModeName();
+  json += F("\",\"profile\":\"");
+  json += activeLoRaProfile().name;
+  json += F("\",\"peer\":\"");
+  appendJsonEscaped(json, peerId);
+  json += F("\",\"radio_ready\":");
+  json += radioReady ? F("true") : F("false");
+  json += F(",\"http_ready\":");
+  json += remoteHttpReady ? F("true") : F("false");
+  json += F(",\"ble_ready\":");
+  json += remoteBleReady ? F("true") : F("false");
+  json += F(",\"wifi_mode\":\"");
+  json += remoteWifiFallbackApActive ? F("fallback_ap") : F("station");
+  json += F("\",\"wifi_address\":\"");
+  json += remoteWifiFallbackApActive ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  json += '"';
+  json += F(",\"benchmark_active\":");
+  json += benchmark.active ? F("true") : F("false");
+  json += F(",\"sweep_active\":");
+  json += profileSweep.active ? F("true") : F("false");
+  json += F(",\"queued_commands\":");
+  json += remoteCommandQueue == nullptr ? 0 : uxQueueMessagesWaiting(remoteCommandQueue);
+  json += F(",\"last_command_source\":\"");
+  appendJsonEscaped(json, lastRemoteCommandSource);
+  json += F("\",\"last_command_ms\":");
+  json += lastRemoteCommandAt;
+  json += '}';
+  return json;
+}
+
+void sendRemoteHttpQueueResult(RemoteEnqueueResult result) {
+  int statusCode = 202;
+  if (result == RemoteEnqueueResult::EMPTY) {
+    statusCode = 400;
+  } else if (result == RemoteEnqueueResult::TOO_LONG) {
+    statusCode = 413;
+  } else if (result == RemoteEnqueueResult::FULL) {
+    statusCode = 503;
+  }
+
+  String response = String("{\"status\":\"") + remoteEnqueueResultName(result) + "\"}";
+  remoteApiServer.send(statusCode, "application/json", response);
+}
+
+IPAddress subnetMaskFromPrefix(uint8_t prefixLength) {
+  const uint32_t mask = prefixLength == 0 ? 0 : 0xFFFFFFFFUL << (32 - prefixLength);
+  return IPAddress(static_cast<uint8_t>(mask >> 24), static_cast<uint8_t>(mask >> 16), static_cast<uint8_t>(mask >> 8), static_cast<uint8_t>(mask));
+}
+
+bool startFallbackAccessPoint() {
+  const String fallbackSsid = String("Nesso-") + nodeId;
+  const IPAddress address(192, 168, 4, 1);
+  const IPAddress subnet(255, 255, 255, 0);
+  WiFi.mode(remoteWifiSsid.length() ? WIFI_AP_STA : WIFI_AP);
+  if (!WiFi.softAPConfig(address, address, subnet) || !WiFi.softAP(fallbackSsid.c_str(), FALLBACK_AP_PASSWORD, 1, 0, 2)) {
+    Serial.println(F("[Remote] recovery Wi-Fi access point failed"));
+    return false;
+  }
+
+  remoteWifiFallbackApActive = true;
+  Serial.print(F("[Remote] recovery AP "));
+  Serial.print(fallbackSsid);
+  Serial.print(F(" at http://"));
+  Serial.println(WiFi.softAPIP());
+  return true;
+}
+
+bool beginRemoteWifiStation() {
+  if (!remoteWifiSsid.length()) {
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  if (remoteWifiStaticAddress) {
+    const IPAddress empty(0, 0, 0, 0);
+    if (!WiFi.config(remoteWifiAddress, empty, subnetMaskFromPrefix(remoteWifiPrefixLength), empty, empty)) {
+      Serial.println(F("[Remote] static station address configuration failed"));
+      return false;
+    }
+  } else if (!WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE)) {
+    Serial.println(F("[Remote] DHCP station configuration failed"));
+    return false;
+  }
+
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(remoteWifiSsid.c_str(), remoteWifiPassword.length() ? remoteWifiPassword.c_str() : nullptr);
+  Serial.print(F("[Remote] connecting Wi-Fi station to "));
+  Serial.println(remoteWifiSsid);
+  remoteWifiDisconnectedAt = millis();
+  return true;
+}
+
+void maintainRemoteWifi() {
+  if (!remoteWifiSsid.length()) {
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    remoteWifiDisconnectedAt = 0;
+    if (!remoteWifiEverConnected) {
+      Serial.print(F("[Remote] Wi-Fi station at http://"));
+      Serial.println(WiFi.localIP());
+    }
+    remoteWifiEverConnected = true;
+    if (remoteWifiFallbackApActive) {
+      WiFi.softAPdisconnect(false);
+      WiFi.mode(WIFI_STA);
+      remoteWifiFallbackApActive = false;
+      Serial.print(F("[Remote] station recovered at http://"));
+      Serial.println(WiFi.localIP());
+    }
+    return;
+  }
+
+  if (remoteWifiDisconnectedAt == 0) {
+    remoteWifiDisconnectedAt = millis();
+  }
+  const uint32_t fallbackDelayMs = remoteWifiEverConnected ? WIFI_FALLBACK_DELAY_MS : WIFI_STATION_CONNECT_TIMEOUT_MS;
+  if (!remoteWifiFallbackApActive && static_cast<uint32_t>(millis() - remoteWifiDisconnectedAt) >= fallbackDelayMs) {
+    if (!remoteWifiEverConnected) {
+      Serial.println(F("[Remote] initial station connection timed out"));
+    }
+    startFallbackAccessPoint();
+  }
+}
+
+void setupRemoteHttpApi() {
+  if (remoteCommandQueue == nullptr) {
+    remoteCommandQueue = xQueueCreate(REMOTE_COMMAND_QUEUE_DEPTH, sizeof(RemoteCommand));
+  }
+  if (remoteCommandQueue == nullptr) {
+    Serial.println(F("[Remote] command queue allocation failed"));
+    return;
+  }
+
+  WiFi.persistent(false);
+  if (!remoteWifiSsid.length()) {
+    if (!startFallbackAccessPoint()) {
+      return;
+    }
+  } else if (!beginRemoteWifiStation() && !startFallbackAccessPoint()) {
+    return;
+  }
+
+  remoteApiServer.enableCORS(true);
+  remoteApiServer.on("/", HTTP_GET, []() {
+    remoteApiServer.send(200, "application/json", "{\"service\":\"Nesso N1 LoRa Exerciser\",\"command\":\"POST /command as text/plain or GET /command?command=...\",\"status\":\"GET /status\"}");
+  });
+  remoteApiServer.on("/status", HTTP_GET, []() {
+    remoteApiServer.send(200, "application/json", remoteStatusJson());
+  });
+  remoteApiServer.on("/command", HTTP_POST, []() {
+    sendRemoteHttpQueueResult(enqueueRemoteCommand(remoteApiServer.arg("plain"), "HTTP"));
+  });
+  remoteApiServer.on("/command", HTTP_GET, []() {
+    String command = remoteApiServer.arg("command");
+    if (!command.length()) {
+      command = remoteApiServer.arg("cmd");
+    }
+    sendRemoteHttpQueueResult(enqueueRemoteCommand(command, "HTTP"));
+  });
+  remoteApiServer.onNotFound([]() {
+    remoteApiServer.send(404, "application/json", "{\"status\":\"not_found\"}");
+  });
+  remoteApiServer.begin();
+  remoteHttpReady = true;
+}
+
+void setRemoteBleIngressStatus(const String& status) {
+  if (remoteBleStatusCharacteristic != nullptr) {
+    remoteBleStatusCharacteristic->setValue(status);
+  }
+}
+
+void resetRemoteBleAssembly() {
+  remoteBleCommandAssembly = "";
+  remoteBleExpectedLength = 0;
+  remoteBleAssemblyActive = false;
+}
+
+class RemoteBleCommandCallbacks : public BLECharacteristicCallbacks {
+public:
+  void onWrite(BLECharacteristic* characteristic) override {
+    const String value = characteristic->getValue();
+    if (value.startsWith("@begin:")) {
+      const long requestedLength = value.substring(7).toInt();
+      resetRemoteBleAssembly();
+      if (requestedLength <= 0 || requestedLength > static_cast<long>(REMOTE_COMMAND_MAX_LENGTH)) {
+        setRemoteBleIngressStatus("invalid_length");
+        return;
+      }
+      remoteBleExpectedLength = static_cast<size_t>(requestedLength);
+      remoteBleCommandAssembly.reserve(remoteBleExpectedLength + 1);
+      remoteBleAssemblyActive = true;
+      setRemoteBleIngressStatus("chunk_ready");
+      return;
+    }
+
+    if (value.startsWith("@data:")) {
+      if (!remoteBleAssemblyActive) {
+        setRemoteBleIngressStatus("no_chunk_session");
+        return;
+      }
+      const String chunk = value.substring(6);
+      if (remoteBleCommandAssembly.length() + chunk.length() > remoteBleExpectedLength) {
+        resetRemoteBleAssembly();
+        setRemoteBleIngressStatus("chunk_too_long");
+        return;
+      }
+      remoteBleCommandAssembly += chunk;
+      setRemoteBleIngressStatus(String("chunk:") + remoteBleCommandAssembly.length() + '/' + remoteBleExpectedLength);
+      return;
+    }
+
+    if (value == "@end") {
+      if (!remoteBleAssemblyActive || remoteBleCommandAssembly.length() != remoteBleExpectedLength) {
+        resetRemoteBleAssembly();
+        setRemoteBleIngressStatus("length_mismatch");
+        return;
+      }
+      const RemoteEnqueueResult result = enqueueRemoteCommand(remoteBleCommandAssembly, "BLE");
+      resetRemoteBleAssembly();
+      setRemoteBleIngressStatus(remoteEnqueueResultName(result));
+      return;
+    }
+
+    if (value == "@cancel") {
+      resetRemoteBleAssembly();
+      setRemoteBleIngressStatus("cancelled");
+      return;
+    }
+
+    setRemoteBleIngressStatus(remoteEnqueueResultName(enqueueRemoteCommand(value, "BLE")));
+  }
+};
+
+void setupRemoteBleApi() {
+  if (remoteCommandQueue == nullptr) {
+    remoteCommandQueue = xQueueCreate(REMOTE_COMMAND_QUEUE_DEPTH, sizeof(RemoteCommand));
+  }
+  if (remoteCommandQueue == nullptr) {
+    Serial.println(F("[Remote] BLE command queue allocation failed"));
+    return;
+  }
+
+  const String deviceName = remoteBleDeviceName;
+  if (!BLEDevice::init(deviceName)) {
+    Serial.println(F("[Remote] BLE initialization failed"));
+    return;
+  }
+  BLEDevice::setMTU(517);
+
+  BLEServer* server = BLEDevice::createServer();
+  server->advertiseOnDisconnect(true);
+  BLEService* service = server->createService(REMOTE_BLE_SERVICE_UUID);
+  BLECharacteristic* commandCharacteristic = service->createCharacteristic(REMOTE_BLE_COMMAND_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  remoteBleStatusCharacteristic = service->createCharacteristic(REMOTE_BLE_STATUS_UUID, BLECharacteristic::PROPERTY_READ);
+  commandCharacteristic->setCallbacks(new RemoteBleCommandCallbacks());
+  remoteBleStatusCharacteristic->setValue("ready");
+  service->start();
+
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(REMOTE_BLE_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  remoteBleReady = true;
+
+  Serial.print(F("[Remote] BLE device "));
+  Serial.println(deviceName);
+}
+
 uint16_t activePreambleLength() {
   return radioMode == RadioMode::LORA ? activeLoRaProfile().preambleSymbols : FSK_PREAMBLE_BITS;
 }
@@ -518,13 +1211,208 @@ String clipped(const String& value, size_t maxLength) {
   return value.substring(0, maxLength - 3) + "...";
 }
 
-void drawDisplayLine(const String& text, int32_t y, uint16_t color = COLOR_WHITE) {
+constexpr int16_t UI_WIDTH = 240;
+constexpr int16_t UI_HEADER_HEIGHT = 20;
+constexpr int16_t UI_NAV_Y = 113;
+constexpr int16_t UI_NAV_HEIGHT = 22;
+constexpr int16_t UI_NOTICE_Y = 102;
+
+void redrawDisplay();
+
+void drawUiText(const String& text, int16_t x, int16_t y, uint16_t color = COLOR_WHITE, textdatum_t datum = TL_DATUM, uint8_t size = 1) {
   if (!displayReady) {
     return;
   }
-  String line = clipped(text, 38);
+
+  nessoDisplay.setTextDatum(datum);
+  nessoDisplay.setTextSize(size);
   nessoDisplay.setTextColor(color);
-  nessoDisplay.drawString(line.c_str(), 0, y);
+  nessoDisplay.drawString(text.c_str(), x, y);
+}
+
+void drawUiButton(int16_t x, int16_t y, int16_t width, int16_t height, const String& label, bool active = false, uint8_t textSize = 1) {
+  const uint16_t fillColor = active ? 0x0320 : COLOR_DARK;
+  const uint16_t borderColor = active ? COLOR_GREEN : COLOR_GRAY;
+  nessoDisplay.fillRoundRect(x, y, width, height, 3, fillColor);
+  nessoDisplay.drawRoundRect(x, y, width, height, 3, borderColor);
+  drawUiText(label, x + width / 2, y + height / 2, active ? COLOR_GREEN : COLOR_WHITE, MC_DATUM, textSize);
+}
+
+void drawUiHeader(const String& title) {
+  nessoDisplay.fillRect(0, 0, UI_WIDTH, UI_HEADER_HEIGHT, COLOR_DARK);
+  drawUiText(title, 4, UI_HEADER_HEIGHT / 2, COLOR_CYAN, ML_DATUM);
+  drawUiText(nodeId, UI_WIDTH - 4, UI_HEADER_HEIGHT / 2, COLOR_WHITE, MR_DATUM);
+}
+
+void drawUiNavigation() {
+  const char* labels[] = { "Home", "Radio", "Test", "Access", "Peers" };
+  UiPage activePage = uiPage == UiPage::RESULTS ? UiPage::TEST : uiPage;
+  for (uint8_t index = 0; index < 5; ++index) {
+    const int16_t x = index * 48;
+    const bool active = static_cast<uint8_t>(activePage) == index;
+    nessoDisplay.fillRect(x, UI_NAV_Y, 48, UI_NAV_HEIGHT, active ? COLOR_BLUE : COLOR_DARK);
+    nessoDisplay.drawRect(x, UI_NAV_Y, 48, UI_NAV_HEIGHT, COLOR_BLACK);
+    drawUiText(labels[index], x + 24, UI_NAV_Y + UI_NAV_HEIGHT / 2, COLOR_WHITE, MC_DATUM);
+  }
+}
+
+void drawUiNotice(const String& fallback = "") {
+  String text = fallback;
+  if (uiNotice.length() && !timeReached(millis(), uiNoticeUntil)) {
+    text = uiNotice;
+  }
+  nessoDisplay.fillRect(0, UI_NOTICE_Y, UI_WIDTH, UI_NAV_Y - UI_NOTICE_Y, COLOR_BLACK);
+  drawUiText(clipped(text, 38), UI_WIDTH / 2, UI_NOTICE_Y + 5, COLOR_YELLOW, MC_DATUM);
+}
+
+void setUiNotice(const String& text, uint32_t durationMs = 3000) {
+  uiNotice = text;
+  uiNoticeUntil = millis() + durationMs;
+  redrawDisplay();
+}
+
+void drawHomePage() {
+  String title = String(radioModeName()) + " / " + activeLoRaProfile().name;
+  drawUiHeader(title);
+  drawUiButton(3, 23, 115, 35, "HELLO", false, 2);
+  drawUiButton(122, 23, 115, 35, "PING", false, 2);
+  drawUiButton(3, 62, 115, 35, "TEXT", false, 2);
+  drawUiButton(122, 62, 115, 35, "TELEM", false, 2);
+
+  String status = peerId.length() ? String("Peer ") + peerId : "Searching for peer";
+  if (lastReceivedText.length()) {
+    status = String("RX: ") + lastReceivedText;
+  }
+  drawUiNotice(status);
+}
+
+void drawRadioPage() {
+  drawUiHeader("Synchronize radio");
+  drawUiButton(3, 23, 115, 28, "LoRa", radioMode == RadioMode::LORA, 2);
+  drawUiButton(122, 23, 115, 28, "GFSK", radioMode == RadioMode::FSK, 2);
+  drawUiButton(3, 55, 115, 21, "DEFAULT", activeProfileIndex == 0);
+  drawUiButton(122, 55, 115, 21, "FAST", activeProfileIndex == 1);
+  drawUiButton(3, 79, 115, 21, "ROBUST", activeProfileIndex == 2);
+  drawUiButton(122, 79, 115, 21, "MAX RANGE", activeProfileIndex == 3);
+  drawUiNotice("Tap, then confirm");
+}
+
+void drawTestPage() {
+  drawUiHeader("Link tests");
+  drawUiButton(3, 23, 115, 35, "CAD", false, 2);
+  drawUiButton(122, 23, 115, 35, "BENCH 10", benchmark.active, 2);
+  drawUiButton(3, 62, 115, 35, "SWEEP 5", profileSweep.active, 2);
+  drawUiButton(122, 62, 115, 35, benchmark.active || profileSweep.active ? "STOP" : "RESULTS", false, 2);
+
+  String status = "Ready";
+  if (profileSweep.active) {
+    status = String("Sweep ") + String(profileSweep.profileIndex + 1) + '/' + String(LORA_PROFILE_COUNT);
+  } else if (benchmark.active) {
+    status = String("Benchmark ") + String(benchmark.sentPackets) + '/' + String(benchmark.requestedPackets) + " RX " + String(benchmark.receivedReplies);
+  }
+  drawUiNotice(status);
+}
+
+void drawAccessPage() {
+  drawUiHeader("Channel and receive");
+  drawUiButton(3, 23, 76, 35, "CAD", listenBeforeTalkEnabled);
+  drawUiButton(82, 23, 76, 35, "DUTY 1%", dutyCycleLimitEnabled);
+  drawUiButton(161, 23, 76, 35, "SLOTS", slottedAccessEnabled);
+  drawUiButton(3, 62, 76, 35, "LOW RX", lowPowerReceiveEnabled);
+  drawUiButton(82, 62, 76, 35, "BOOST", receiveBoostedGainEnabled);
+  drawUiButton(161, 62, 76, 35, "RELAY", relayEnabled);
+  drawUiNotice("Green = enabled");
+}
+
+uint8_t peerCount() {
+  uint8_t count = 0;
+  for (const PeerInfo& peer : peers) {
+    if (peer.id.length()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+PeerInfo* peerAtUiIndex(uint8_t index) {
+  uint8_t current = 0;
+  for (PeerInfo& peer : peers) {
+    if (!peer.id.length()) {
+      continue;
+    }
+    if (current == index) {
+      return &peer;
+    }
+    ++current;
+  }
+  return nullptr;
+}
+
+void drawPeerCard(int16_t x, int16_t y, PeerInfo* peer) {
+  if (peer == nullptr) {
+    nessoDisplay.drawRoundRect(x, y, 87, 35, 3, COLOR_DARK);
+    return;
+  }
+
+  const bool selected = peer->id == peerId;
+  nessoDisplay.fillRoundRect(x, y, 87, 35, 3, selected ? 0x0320 : COLOR_DARK);
+  nessoDisplay.drawRoundRect(x, y, 87, 35, 3, selected ? COLOR_GREEN : COLOR_GRAY);
+  drawUiText(peer->id, x + 43, y + 10, selected ? COLOR_GREEN : COLOR_WHITE, MC_DATUM);
+  drawUiText(String(peer->lastRssi, 1) + " dBm", x + 43, y + 25, COLOR_WHITE, MC_DATUM);
+}
+
+void drawPeersPage() {
+  const uint8_t count = peerCount();
+  const uint8_t pageCount = max<uint8_t>(1, static_cast<uint8_t>((count + 3) / 4));
+  if (uiPeerPage >= pageCount) {
+    uiPeerPage = 0;
+  }
+
+  drawUiHeader(String("Peers ") + String(uiPeerPage + 1) + '/' + String(pageCount));
+  drawUiButton(3, 23, 53, 35, "AUTO", !peerSelectionLocked);
+  drawUiButton(3, 62, 53, 35, "NEXT", false);
+  const uint8_t firstIndex = uiPeerPage * 4;
+  drawPeerCard(60, 23, peerAtUiIndex(firstIndex));
+  drawPeerCard(150, 23, peerAtUiIndex(firstIndex + 1));
+  drawPeerCard(60, 62, peerAtUiIndex(firstIndex + 2));
+  drawPeerCard(150, 62, peerAtUiIndex(firstIndex + 3));
+  drawUiNotice(count ? "Tap peer to lock" : "Waiting for peers");
+}
+
+void drawResultsPage() {
+  drawUiHeader("Benchmark results");
+  if (!benchmark.active && !benchmarkResultAvailable) {
+    drawUiText("No benchmark result", UI_WIDTH / 2, 60, COLOR_WHITE, MC_DATUM, 2);
+    drawUiNotice("Run BENCH or SWEEP");
+    return;
+  }
+
+  const RadioMode resultMode = benchmark.active ? radioMode : benchmarkResultMode;
+  const uint8_t resultProfile = benchmark.active ? activeProfileIndex : benchmarkResultProfileIndex;
+  const uint32_t elapsedMs = benchmark.active ? max<uint32_t>(millis() - benchmark.startedAt, 1UL) : max<uint32_t>(benchmarkResultElapsedMs, 1UL);
+  const float delivery = benchmark.requestedPackets ? 100.0f * benchmark.receivedReplies / benchmark.requestedPackets : 0.0f;
+  const float averageRtt = benchmark.receivedReplies ? static_cast<float>(benchmark.totalRttMs) / benchmark.receivedReplies : 0.0f;
+  const float averageRssi = benchmark.receivedReplies ? benchmark.totalRssi / benchmark.receivedReplies : 0.0f;
+  const float averageSnr = benchmark.receivedReplies ? benchmark.totalSnr / benchmark.receivedReplies : 0.0f;
+  const float throughput = static_cast<float>(benchmark.receivedReplies * benchmark.payloadLength * 8ULL * 1000ULL) / elapsedMs;
+  const uint64_t airtimeUs = benchmark.active ? totalTransmitAirtimeUs - benchmark.startingAirtimeUs : benchmarkResultAirtimeUs;
+
+  drawUiText(String(resultMode == RadioMode::LORA ? "LoRa " : "GFSK ") + LORA_PROFILES[resultProfile].name, 4, 25, COLOR_CYAN);
+  drawUiText(String("Sent ") + benchmark.sentPackets + '/' + benchmark.requestedPackets + "  RX " + benchmark.receivedReplies + "  " + String(delivery, 1) + '%', 4, 38);
+  drawUiText(String("RTT ") + String(averageRtt, 1) + " ms", 4, 51);
+  drawUiText(String("RSSI ") + String(averageRssi, 1) + "  SNR " + String(averageSnr, 1), 4, 64);
+  drawUiText(String("Rate ") + String(throughput, 1) + " bps", 4, 77);
+  drawUiText(String("Airtime ") + String(static_cast<double>(airtimeUs) / 1000.0, 1) + " ms", 4, 90);
+  drawUiNotice(benchmark.active ? "Running" : benchmarkResultReason);
+}
+
+void drawRadioConfirmation() {
+  nessoDisplay.fillRoundRect(8, 23, 224, 82, 5, COLOR_BLACK);
+  nessoDisplay.drawRoundRect(8, 23, 224, 82, 5, COLOR_YELLOW);
+  drawUiText("SYNC RADIO?", UI_WIDTH / 2, 38, COLOR_YELLOW, MC_DATUM, 2);
+  drawUiText(String(uiPendingRadioMode == RadioMode::LORA ? "LoRa / " : "GFSK / ") + LORA_PROFILES[uiPendingProfileIndex].name, UI_WIDTH / 2, 58, COLOR_WHITE, MC_DATUM);
+  drawUiButton(18, 72, 96, 26, "APPLY", true, 2);
+  drawUiButton(126, 72, 96, 26, "CANCEL", false, 2);
 }
 
 void redrawDisplay() {
@@ -533,14 +1421,31 @@ void redrawDisplay() {
   }
 
   nessoDisplay.fillScreen(COLOR_BLACK);
-  nessoDisplay.setTextSize(2);
-  drawDisplayLine("N1 LoRa", 0, COLOR_CYAN);
-  nessoDisplay.setTextSize(1);
-  drawDisplayLine(String("ID: ") + nodeId, 25, COLOR_WHITE);
-  drawDisplayLine(String("Peer: ") + (peerId.length() ? peerId : "searching"), 39, COLOR_YELLOW);
-  drawDisplayLine(String("RX: ") + (lastReceivedText.length() ? lastReceivedText : "(none)"), 57, COLOR_GREEN);
-  drawDisplayLine(String("RSSI ") + String(lastReceivedRssi, 1) + " SNR " + String(lastReceivedSnr, 1), 75, COLOR_WHITE);
-  drawDisplayLine("A=text  B=telemetry", 105, COLOR_CYAN);
+  switch (uiPage) {
+    case UiPage::HOME:
+      drawHomePage();
+      break;
+    case UiPage::RADIO:
+      drawRadioPage();
+      break;
+    case UiPage::TEST:
+      drawTestPage();
+      break;
+    case UiPage::ACCESS:
+      drawAccessPage();
+      break;
+    case UiPage::PEERS:
+      drawPeersPage();
+      break;
+    case UiPage::RESULTS:
+      drawResultsPage();
+      break;
+  }
+  drawUiNavigation();
+  if (uiConfirmationActive) {
+    drawRadioConfirmation();
+  }
+  lastUiRefreshAt = millis();
 }
 
 void printRadioError(const char* operation, int state) {
@@ -740,6 +1645,11 @@ void setupDisplay() {
   if (!displayReady) {
     Serial.println(F("[Display] initialization failed"));
     return;
+  }
+
+  touchReady = nessoTouch.begin();
+  if (!touchReady) {
+    Serial.println(F("[Touch] initialization failed"));
   }
 
   nessoDisplay.setRotation(1);
@@ -975,13 +1885,13 @@ bool sendText(const String& text) {
   return true;
 }
 
-void sendHello() {
-  sendPacket('H', "*", "hello", txSequence++);
+bool sendHello() {
+  return sendPacket('H', "*", "hello", txSequence++);
 }
 
-void sendPing() {
+bool sendPing() {
   const uint32_t sequence = txSequence++;
-  sendPacket('P', targetPeerOrBroadcast(), "ping", sequence);
+  return sendPacket('P', targetPeerOrBroadcast(), "ping", sequence);
 }
 
 String localTelemetry() {
@@ -1001,11 +1911,13 @@ String localTelemetry() {
   return body;
 }
 
-void sendTelemetry() {
+bool sendTelemetry() {
   const uint32_t sequence = txSequence++;
-  if (sendPacket('S', targetPeerOrBroadcast(), localTelemetry(), sequence)) {
+  const bool sent = sendPacket('S', targetPeerOrBroadcast(), localTelemetry(), sequence);
+  if (sent) {
     Serial.println(F("[LoRa] telemetry sent"));
   }
+  return sent;
 }
 
 void sendAcknowledgement(const ReceivedPacket& packet) {
@@ -1091,22 +2003,27 @@ void printStatus() {
 void runChannelActivityDetection() {
   if (!radioReady || radioMode != RadioMode::LORA) {
     Serial.println(F("[LoRa] CAD requires a ready radio in LoRa mode"));
+    setUiNotice("CAD requires LoRa");
     return;
   }
 
   int state = radio.standby();
   if (state != RADIOLIB_ERR_NONE) {
     printRadioError("standby before CAD", state);
+    setUiNotice("CAD standby failed");
     return;
   }
 
   const int scanState = radio.scanChannel();
   if (scanState == RADIOLIB_CHANNEL_FREE) {
     Serial.println(F("[LoRa] CAD: channel free"));
+    setUiNotice("CAD: channel free");
   } else if (scanState == RADIOLIB_PREAMBLE_DETECTED) {
     Serial.println(F("[LoRa] CAD: LoRa preamble detected"));
+    setUiNotice("CAD: preamble found");
   } else {
     printRadioError("CAD", scanState);
+    setUiNotice("CAD failed");
   }
 
   state = startConfiguredReceive();
@@ -1164,7 +2081,7 @@ int findLoRaProfile(const String& value) {
   return -1;
 }
 
-bool reinitializeRadio() {
+bool reinitializeRadio(bool persistConfiguration = true) {
   const int state = initializeActiveRadio();
   if (state != RADIOLIB_ERR_NONE) {
     printRadioError("reconfigure", state);
@@ -1175,6 +2092,11 @@ bool reinitializeRadio() {
   Serial.print(radioModeName());
   Serial.print(F(" mode and profile "));
   Serial.println(activeLoRaProfile().name);
+  transientRadioConfigurationActive = !persistConfiguration;
+  if (persistConfiguration) {
+    savePersistentConfigurationIfChanged();
+  }
+  redrawDisplay();
   return true;
 }
 
@@ -1329,6 +2251,15 @@ void enterTimedDeepSleep(uint32_t seconds) {
   Serial.print(seconds);
   Serial.println(F(" seconds; the sketch restarts on wake"));
   Serial.flush();
+  if (remoteHttpReady) {
+    remoteApiServer.stop();
+    remoteHttpReady = false;
+  }
+  WiFi.softAPdisconnect(true);
+  if (remoteBleReady) {
+    BLEDevice::deinit(false);
+    remoteBleReady = false;
+  }
   radio.sleep(false);
   if (displayReady) {
     nessoDisplay.fillScreen(COLOR_BLACK);
@@ -1406,6 +2337,16 @@ void printBenchmarkReport(const char* reason) {
   const float averageRssi = benchmark.receivedReplies == 0 ? 0.0f : benchmark.totalRssi / benchmark.receivedReplies;
   const float averageSnr = benchmark.receivedReplies == 0 ? 0.0f : benchmark.totalSnr / benchmark.receivedReplies;
   const float throughputBps = static_cast<float>(benchmark.receivedReplies * benchmark.payloadLength * 8ULL * 1000ULL) / elapsedMs;
+  const uint64_t benchmarkAirtimeUs = totalTransmitAirtimeUs - benchmark.startingAirtimeUs;
+
+  if (strcmp(reason, "running") != 0 && strcmp(reason, "idle") != 0) {
+    benchmarkResultAvailable = true;
+    benchmarkResultReason = reason;
+    benchmarkResultMode = radioMode;
+    benchmarkResultProfileIndex = activeProfileIndex;
+    benchmarkResultElapsedMs = elapsedMs;
+    benchmarkResultAirtimeUs = benchmarkAirtimeUs;
+  }
 
   Serial.println(F("benchmark_reason,mode,profile,session,requested,attempts,send_failures,sent,replies,delivery_percent,min_rtt_ms,avg_rtt_ms,max_rtt_ms,avg_rssi_dbm,avg_snr_db,throughput_bps,airtime_ms"));
   Serial.print(reason);
@@ -1440,7 +2381,7 @@ void printBenchmarkReport(const char* reason) {
   Serial.print(',');
   Serial.print(throughputBps, 1);
   Serial.print(',');
-  Serial.println(static_cast<double>(totalTransmitAirtimeUs - benchmark.startingAirtimeUs) / 1000.0, 3);
+  Serial.println(static_cast<double>(benchmarkAirtimeUs) / 1000.0, 3);
 }
 
 // Benchmarks use echoed timestamps rather than synchronized clocks, allowing
@@ -1456,6 +2397,7 @@ void startBenchmark(uint16_t packetCount, size_t payloadLength, bool startedBySw
   }
 
   benchmark = BenchmarkState();
+  benchmarkResultAvailable = false;
   benchmark.active = true;
   benchmark.session = esp_random();
   benchmark.destination = targetPeerOrBroadcast();
@@ -1471,6 +2413,7 @@ void startBenchmark(uint16_t packetCount, size_t payloadLength, bool startedBySw
   Serial.print(packetCount);
   Serial.print(F(", payload "));
   Serial.println(payloadLength);
+  redrawDisplay();
 }
 
 void runBenchmarkTask() {
@@ -1499,13 +2442,21 @@ void runBenchmarkTask() {
   if (benchmark.receivedReplies >= benchmark.requestedPackets) {
     printBenchmarkReport("complete");
     benchmark.active = false;
+    if (!profileSweep.active && uiPage == UiPage::TEST) {
+      uiPage = UiPage::RESULTS;
+    }
+    redrawDisplay();
   } else if (benchmark.allSentAt != 0 && timeReached(now, benchmark.allSentAt + BENCHMARK_REPLY_TIMEOUT_MS)) {
     printBenchmarkReport("timeout");
     benchmark.active = false;
+    if (!profileSweep.active && uiPage == UiPage::TEST) {
+      uiPage = UiPage::RESULTS;
+    }
+    redrawDisplay();
   }
 }
 
-void scheduleRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t delayMs) {
+void scheduleRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t delayMs, bool persist = true) {
   if (profileIndex >= LORA_PROFILE_COUNT) {
     return;
   }
@@ -1513,6 +2464,7 @@ void scheduleRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t d
   pendingRadioConfiguration.mode = mode;
   pendingRadioConfiguration.profileIndex = profileIndex;
   pendingRadioConfiguration.applyAt = millis() + delayMs;
+  pendingRadioConfiguration.persist = persist;
   Serial.print(F("[Radio] scheduled "));
   Serial.print(mode == RadioMode::LORA ? "LoRa" : "GFSK");
   Serial.print(F(" / "));
@@ -1520,9 +2472,10 @@ void scheduleRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t d
   Serial.print(F(" in "));
   Serial.print(delayMs);
   Serial.println(F(" ms"));
+  redrawDisplay();
 }
 
-bool requestRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t delayMs = 3000) {
+bool requestRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t delayMs = 3000, bool persist = true) {
   if (profileIndex >= LORA_PROFILE_COUNT) {
     return false;
   }
@@ -1531,10 +2484,12 @@ bool requestRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t de
   body += String(profileIndex);
   body += ',';
   body += String(delayMs);
+  body += ',';
+  body += persist ? '1' : '0';
   if (!sendPacket('M', targetPeerOrBroadcast(), body, txSequence++)) {
     return false;
   }
-  scheduleRadioConfiguration(mode, profileIndex, delayMs);
+  scheduleRadioConfiguration(mode, profileIndex, delayMs, persist);
   return true;
 }
 
@@ -1545,8 +2500,9 @@ void runPendingRadioConfigurationTask() {
 
   radioMode = pendingRadioConfiguration.mode;
   activeProfileIndex = pendingRadioConfiguration.profileIndex;
+  const bool persist = pendingRadioConfiguration.persist;
   pendingRadioConfiguration.active = false;
-  reinitializeRadio();
+  reinitializeRadio(persist);
 }
 
 void scheduleSlottedAccess(uint32_t delayMs) {
@@ -1580,12 +2536,13 @@ void startProfileSweep(uint16_t packetCount, size_t payloadLength) {
   profileSweep.profileIndex = 0;
   profileSweep.packetCount = packetCount;
   profileSweep.payloadLength = payloadLength;
-  if (!requestRadioConfiguration(RadioMode::LORA, profileSweep.profileIndex)) {
+  if (!requestRadioConfiguration(RadioMode::LORA, profileSweep.profileIndex, 3000, false)) {
     profileSweep = ProfileSweepState();
     return;
   }
   profileSweep.nextActionAt = millis() + 4500UL;
   Serial.println(F("[Sweep] started"));
+  redrawDisplay();
 }
 
 void stopProfileSweep(const char* reason) {
@@ -1593,6 +2550,7 @@ void stopProfileSweep(const char* reason) {
   profileSweep = ProfileSweepState();
   Serial.print(F("[Sweep] "));
   Serial.println(reason);
+  redrawDisplay();
 }
 
 void runProfileSweepTask() {
@@ -1604,13 +2562,17 @@ void runProfileSweepTask() {
     if (!timeReached(millis(), profileSweep.nextActionAt)) {
       return;
     }
-    if (!requestRadioConfiguration(RadioMode::LORA, profileSweep.profileIndex)) {
+    if (!requestRadioConfiguration(RadioMode::LORA, profileSweep.profileIndex, 3000, false)) {
       profileSweep.nextActionAt = millis() + TX_MIN_INTERVAL_MS;
       return;
     }
     if (profileSweep.returningToDefault) {
       profileSweep = ProfileSweepState();
       Serial.println(F("[Sweep] complete; returning to default profile"));
+      if (uiPage == UiPage::TEST) {
+        uiPage = UiPage::RESULTS;
+      }
+      redrawDisplay();
       return;
     }
     profileSweep.phase = SweepPhase::WAITING_FOR_PROFILE;
@@ -2057,8 +3019,10 @@ void handleReceivedPacket(const String& raw, float rssi, float snr) {
       const String mode = takeDelimitedToken(fields, ',');
       const uint8_t profileIndex = static_cast<uint8_t>(takeDelimitedToken(fields, ',').toInt());
       const uint32_t delayMs = static_cast<uint32_t>(strtoul(takeDelimitedToken(fields, ',').c_str(), nullptr, 10));
+      const String persistText = takeDelimitedToken(fields, ',');
+      const bool persist = persistText.length() == 0 || persistText == "1";
       if ((mode == "L" || mode == "F") && profileIndex < LORA_PROFILE_COUNT && delayMs >= 1000 && delayMs <= 30000) {
-        scheduleRadioConfiguration(mode == "L" ? RadioMode::LORA : RadioMode::FSK, profileIndex, delayMs);
+        scheduleRadioConfiguration(mode == "L" ? RadioMode::LORA : RadioMode::FSK, profileIndex, delayMs, persist);
       } else {
         Serial.println(F("[Radio] ignored invalid configuration packet"));
       }
@@ -2183,10 +3147,83 @@ void handleCommand(String command) {
     Serial.println(F("  sweep <packets> [bytes] | sweep stop"));
     Serial.println(F("  transfer <text> | transfer status|resume|cancel"));
     Serial.println(F("  relay on|off | relay send <node-id|*> <hops> <text>"));
+    Serial.println(F("  config | config defaults | config restart"));
+    Serial.println(F("  wifi ssid <name> | wifi password <value|open> | wifi clear"));
+    Serial.println(F("  wifi address dhcp|<a.a.a.a/s> | ble name <name>"));
     return;
   }
 
-  if (command.startsWith("t ")) {
+  if (command == "config") {
+    printPersistentConfiguration();
+  } else if (command == "config defaults") {
+    if (benchmark.active || profileSweep.active || outgoingTransfer.active || pendingRadioConfiguration.active) {
+      Serial.println(F("[Config] stop the active exercise before restoring defaults"));
+    } else {
+      const PersistentConfiguration defaults = defaultPersistentConfiguration();
+      applyPersistentConfiguration(defaults);
+      if (reinitializeRadio()) {
+        Serial.println(F("[Config] defaults restored; restart to apply Wi-Fi and BLE defaults"));
+      }
+    }
+  } else if (command == "config restart") {
+    Serial.println(F("[Config] restarting"));
+    Serial.flush();
+    ESP.restart();
+  } else if (command == "wifi clear") {
+    remoteWifiSsid = "";
+    remoteWifiPassword = "";
+    remoteWifiStaticAddress = false;
+    savePersistentConfigurationIfChanged();
+    Serial.println(F("[Config] station credentials cleared; restart for fixed recovery AP"));
+  } else if (command.startsWith("wifi ssid ")) {
+    String value = command.substring(10);
+    value.trim();
+    if (!value.length() || value.length() > 32) {
+      Serial.println(F("[Config] Wi-Fi SSID must be 1 to 32 bytes"));
+    } else {
+      remoteWifiSsid = value;
+      savePersistentConfigurationIfChanged();
+      Serial.println(F("[Config] Wi-Fi SSID stored; restart to connect"));
+    }
+  } else if (command.startsWith("wifi password ")) {
+    String value = command.substring(14);
+    if (value == "open") {
+      value = "";
+    }
+    if (value.length() && (value.length() < 8 || value.length() > 63)) {
+      Serial.println(F("[Config] Wi-Fi password must be 8 to 63 bytes, or open"));
+    } else {
+      remoteWifiPassword = value;
+      savePersistentConfigurationIfChanged();
+      Serial.println(F("[Config] Wi-Fi password stored; restart to connect"));
+    }
+  } else if (command == "wifi address dhcp") {
+    remoteWifiStaticAddress = false;
+    savePersistentConfigurationIfChanged();
+    Serial.println(F("[Config] station DHCP stored; restart to apply"));
+  } else if (command.startsWith("wifi address ")) {
+    IPAddress address;
+    uint8_t prefixLength = 0;
+    if (!parseWifiCidr(command.substring(13), address, prefixLength)) {
+      Serial.println(F("Usage: wifi address dhcp|<a.a.a.a/8-30>"));
+    } else {
+      remoteWifiAddress = address;
+      remoteWifiPrefixLength = prefixLength;
+      remoteWifiStaticAddress = true;
+      savePersistentConfigurationIfChanged();
+      Serial.println(F("[Config] static station address stored; restart to apply"));
+    }
+  } else if (command.startsWith("ble name ")) {
+    String value = command.substring(9);
+    value.trim();
+    if (!value.length() || value.length() > 24) {
+      Serial.println(F("[Config] BLE name must be 1 to 24 bytes"));
+    } else {
+      remoteBleDeviceName = value;
+      savePersistentConfigurationIfChanged();
+      Serial.println(F("[Config] BLE name stored; restart to apply"));
+    }
+  } else if (command.startsWith("t ")) {
     sendText(command.substring(2));
   } else if (command == "p") {
     sendPing();
@@ -2267,26 +3304,40 @@ void handleCommand(String command) {
       Serial.println(F("Usage: whitening on|off"));
     }
   } else if (command == "rxgain power" || command == "rxgain boosted") {
-    receiveBoostedGainEnabled = command == "rxgain boosted";
-    const int state = radio.setRxBoostedGainMode(receiveBoostedGainEnabled);
+    const bool requested = command == "rxgain boosted";
+    const int state = radio.setRxBoostedGainMode(requested);
     if (state != RADIOLIB_ERR_NONE) {
       printRadioError("setRxBoostedGainMode", state);
+    } else {
+      receiveBoostedGainEnabled = requested;
+      savePersistentConfigurationIfChanged();
     }
   } else if (command.startsWith("lowpower ")) {
-    if (parseToggle(command.substring(9), lowPowerReceiveEnabled)) {
+    bool requested;
+    if (parseToggle(command.substring(9), requested)) {
+      const bool previous = lowPowerReceiveEnabled;
+      lowPowerReceiveEnabled = requested;
       const int state = startConfiguredReceive();
       if (state != RADIOLIB_ERR_NONE) {
+        lowPowerReceiveEnabled = previous;
         printRadioError("low-power receive", state);
+      } else {
+        savePersistentConfigurationIfChanged();
       }
     } else {
       Serial.println(F("Usage: lowpower on|off"));
     }
   } else if (command.startsWith("cad auto ")) {
-    if (!parseToggle(command.substring(9), listenBeforeTalkEnabled)) {
+    bool requested;
+    if (!parseToggle(command.substring(9), requested)) {
       Serial.println(F("Usage: cad auto on|off"));
+    } else {
+      listenBeforeTalkEnabled = requested;
+      savePersistentConfigurationIfChanged();
     }
   } else if (command == "duty off") {
     dutyCycleLimitEnabled = false;
+    savePersistentConfigurationIfChanged();
   } else if (command.startsWith("duty ")) {
     const float requestedPercent = command.substring(5).toFloat();
     if (requestedPercent <= 0.0f || requestedPercent > 100.0f) {
@@ -2294,6 +3345,7 @@ void handleCommand(String command) {
     } else {
       dutyCyclePercent = requestedPercent;
       dutyCycleLimitEnabled = true;
+      savePersistentConfigurationIfChanged();
     }
   } else if (command == "slots sync") {
     synchronizeSlottedAccess();
@@ -2384,6 +3436,7 @@ void handleCommand(String command) {
     startTransfer(command.substring(9));
   } else if (command == "relay on" || command == "relay off") {
     relayEnabled = command == "relay on";
+    savePersistentConfigurationIfChanged();
     Serial.print(F("[Relay] forwarding "));
     Serial.println(relayEnabled ? "enabled" : "disabled");
   } else if (command.startsWith("relay send ")) {
@@ -2394,6 +3447,35 @@ void handleCommand(String command) {
   } else {
     Serial.println(F("[LoRa] unknown command; type ? for help"));
   }
+}
+
+void pollRemoteCommandApi() {
+  maintainRemoteWifi();
+  if (remoteHttpReady) {
+    remoteApiServer.handleClient();
+  }
+  if (remoteCommandQueue == nullptr) {
+    return;
+  }
+
+  RemoteCommand queued = {};
+  if (xQueueReceive(remoteCommandQueue, &queued, 0) != pdPASS) {
+    return;
+  }
+
+  lastRemoteCommandSource = queued.source;
+  lastRemoteCommandAt = millis();
+  String displayedCommand = queued.value;
+  String commandTokens = displayedCommand;
+  if (takeToken(commandTokens) == "wifi" && takeToken(commandTokens) == "password") {
+    displayedCommand = "wifi password (redacted)";
+  }
+  Serial.print(F("[Remote] "));
+  Serial.print(queued.source);
+  Serial.print(F(" command: "));
+  Serial.println(displayedCommand);
+  handleCommand(String(queued.value));
+  setUiNotice(String(queued.source) + ": " + clipped(displayedCommand, 28));
 }
 
 void pollSerial() {
@@ -2408,23 +3490,313 @@ void pollSerial() {
   }
 }
 
+bool uiPointInRect(int16_t x, int16_t y, int16_t left, int16_t top, int16_t width, int16_t height) {
+  return x >= left && x < left + width && y >= top && y < top + height;
+}
+
+bool uiLongExerciseActive() {
+  return benchmark.active || profileSweep.active || outgoingTransfer.active || pendingRadioConfiguration.active;
+}
+
+void requestUiRadioChange(RadioMode mode, uint8_t profileIndex) {
+  if (uiLongExerciseActive()) {
+    setUiNotice("Stop active exercise first");
+    return;
+  }
+
+  uiPendingRadioMode = mode;
+  uiPendingProfileIndex = profileIndex;
+  uiConfirmationActive = true;
+  redrawDisplay();
+}
+
+void applyUiRadioChange() {
+  uiConfirmationActive = false;
+  if (requestRadioConfiguration(uiPendingRadioMode, uiPendingProfileIndex)) {
+    setUiNotice("Radio changes in 3 s");
+  } else {
+    setUiNotice("Radio sync was blocked");
+  }
+}
+
+void stopUiTest() {
+  if (profileSweep.active) {
+    stopProfileSweep("stopped from touchscreen");
+  } else if (benchmark.active) {
+    printBenchmarkReport("stopped");
+    benchmark.active = false;
+  }
+  uiPage = UiPage::RESULTS;
+  setUiNotice("Test stopped");
+}
+
+void handleUiHomeTouch(int16_t x, int16_t y) {
+  if (y >= 23 && y < 58) {
+    if (x >= 3 && x < 118) {
+      setUiNotice(sendHello() ? "HELLO sent" : "HELLO blocked");
+    } else if (x >= 122 && x < 237) {
+      setUiNotice(sendPing() ? "Ping sent" : "Ping blocked");
+    }
+  } else if (y >= 62 && y < 97) {
+    if (x >= 3 && x < 118) {
+      setUiNotice(sendText(String("Touch hello from ") + nodeId) ? "Text sent" : "Text unavailable");
+    } else if (x >= 122 && x < 237) {
+      setUiNotice(sendTelemetry() ? "Telemetry sent" : "Telemetry blocked");
+    }
+  }
+}
+
+void handleUiRadioTouch(int16_t x, int16_t y) {
+  if (y >= 23 && y < 51) {
+    if (x >= 3 && x < 118) {
+      requestUiRadioChange(RadioMode::LORA, activeProfileIndex);
+    } else if (x >= 122 && x < 237) {
+      requestUiRadioChange(RadioMode::FSK, activeProfileIndex);
+    }
+    return;
+  }
+  if (y >= 55 && y < 100) {
+    const int8_t row = y < 76 ? 0 : (y >= 79 ? 1 : -1);
+    const int8_t column = x >= 3 && x < 118 ? 0 : (x >= 122 && x < 237 ? 1 : -1);
+    if (row >= 0 && column >= 0) {
+      requestUiRadioChange(radioMode, row * 2 + column);
+    }
+  }
+}
+
+void handleUiTestTouch(int16_t x, int16_t y) {
+  if (y >= 23 && y < 58) {
+    if (x >= 3 && x < 118) {
+      runChannelActivityDetection();
+    } else if (x >= 122 && x < 237) {
+      if (benchmark.active || profileSweep.active) {
+        setUiNotice("Test already running");
+      } else {
+        startBenchmark(10, 64, false);
+        setUiNotice(benchmark.active ? "Benchmark started" : "Benchmark unavailable");
+      }
+    }
+  } else if (y >= 62 && y < 97) {
+    if (x >= 3 && x < 118) {
+      if (benchmark.active || profileSweep.active) {
+        setUiNotice("Test already running");
+      } else {
+        startProfileSweep(5, 64);
+        setUiNotice(profileSweep.active ? "Profile sweep started" : "Sweep unavailable");
+      }
+    } else if (x >= 122 && x < 237) {
+      if (benchmark.active || profileSweep.active) {
+        stopUiTest();
+      } else {
+        uiPage = UiPage::RESULTS;
+        redrawDisplay();
+      }
+    }
+  }
+}
+
+void handleUiAccessTouch(int16_t x, int16_t y) {
+  if (!((y >= 23 && y < 58) || (y >= 62 && y < 97))) {
+    return;
+  }
+
+  const uint8_t row = y < 58 ? 0 : 1;
+  int8_t column = -1;
+  if (x >= 3 && x < 79) {
+    column = 0;
+  } else if (x >= 82 && x < 158) {
+    column = 1;
+  } else if (x >= 161 && x < 237) {
+    column = 2;
+  }
+  if (column < 0) {
+    return;
+  }
+  const uint8_t action = row * 3 + static_cast<uint8_t>(column);
+  switch (action) {
+    case 0:
+      if (!listenBeforeTalkEnabled && radioMode != RadioMode::LORA) {
+        setUiNotice("Automatic CAD needs LoRa");
+        return;
+      }
+      listenBeforeTalkEnabled = !listenBeforeTalkEnabled;
+      savePersistentConfigurationIfChanged();
+      setUiNotice(listenBeforeTalkEnabled ? "Automatic CAD enabled" : "Automatic CAD disabled");
+      break;
+
+    case 1:
+      dutyCycleLimitEnabled = !dutyCycleLimitEnabled;
+      dutyCyclePercent = DEFAULT_DUTY_CYCLE_PERCENT;
+      savePersistentConfigurationIfChanged();
+      setUiNotice(dutyCycleLimitEnabled ? "Duty pacing at 1%" : "Duty pacing disabled");
+      break;
+
+    case 2:
+      if (slottedAccessEnabled) {
+        slottedAccessEnabled = false;
+        setUiNotice("Slotted access disabled");
+      } else {
+        synchronizeSlottedAccess();
+        setUiNotice(slottedAccessEnabled ? "Slots sync in 3 s" : "Slot sync was blocked");
+      }
+      break;
+
+    case 3: {
+      if (!lowPowerReceiveEnabled && radioMode != RadioMode::LORA) {
+        setUiNotice("Low-power RX needs LoRa");
+        return;
+      }
+      const bool previous = lowPowerReceiveEnabled;
+      lowPowerReceiveEnabled = !lowPowerReceiveEnabled;
+      const int state = startConfiguredReceive();
+      if (state != RADIOLIB_ERR_NONE) {
+        lowPowerReceiveEnabled = previous;
+        printRadioError("touch low-power receive", state);
+        setUiNotice("Low-power RX failed");
+      } else {
+        savePersistentConfigurationIfChanged();
+        setUiNotice(lowPowerReceiveEnabled ? "Low-power RX enabled" : "Continuous RX enabled");
+      }
+      break;
+    }
+
+    case 4: {
+      const bool requested = !receiveBoostedGainEnabled;
+      const int state = radio.setRxBoostedGainMode(requested);
+      if (state != RADIOLIB_ERR_NONE) {
+        printRadioError("touch receive gain", state);
+        setUiNotice("Receive gain change failed");
+      } else {
+        receiveBoostedGainEnabled = requested;
+        savePersistentConfigurationIfChanged();
+        setUiNotice(requested ? "Boosted RX gain" : "Power-saving RX gain");
+      }
+      break;
+    }
+
+    case 5:
+      relayEnabled = !relayEnabled;
+      savePersistentConfigurationIfChanged();
+      setUiNotice(relayEnabled ? "Relay forwarding enabled" : "Relay forwarding disabled");
+      break;
+  }
+}
+
+void handleUiPeersTouch(int16_t x, int16_t y) {
+  if (uiPointInRect(x, y, 3, 23, 53, 35)) {
+    peerSelectionLocked = false;
+    peerId = "";
+    setUiNotice("Automatic peer selection");
+    return;
+  }
+  if (uiPointInRect(x, y, 3, 62, 53, 35)) {
+    const uint8_t pages = max<uint8_t>(1, static_cast<uint8_t>((peerCount() + 3) / 4));
+    uiPeerPage = (uiPeerPage + 1) % pages;
+    redrawDisplay();
+    return;
+  }
+
+  if (x < 60 || !((y >= 23 && y < 58) || (y >= 62 && y < 97))) {
+    return;
+  }
+  const uint8_t row = y < 58 ? 0 : 1;
+  const uint8_t column = x < 150 ? 0 : 1;
+  PeerInfo* peer = peerAtUiIndex(uiPeerPage * 4 + row * 2 + column);
+  if (peer != nullptr) {
+    peerId = peer->id;
+    peerSelectionLocked = true;
+    setUiNotice(String("Selected ") + peerId);
+  }
+}
+
+void handleUiTouch(int16_t x, int16_t y) {
+  if (uiConfirmationActive) {
+    if (uiPointInRect(x, y, 18, 72, 96, 26)) {
+      applyUiRadioChange();
+    } else if (uiPointInRect(x, y, 126, 72, 96, 26)) {
+      uiConfirmationActive = false;
+      setUiNotice("Radio change cancelled");
+    }
+    return;
+  }
+
+  if (y >= UI_NAV_Y) {
+    uiPage = static_cast<UiPage>(min<uint8_t>(4, static_cast<uint8_t>(x / 48)));
+    redrawDisplay();
+    return;
+  }
+
+  switch (uiPage) {
+    case UiPage::HOME:
+      handleUiHomeTouch(x, y);
+      break;
+    case UiPage::RADIO:
+      handleUiRadioTouch(x, y);
+      break;
+    case UiPage::TEST:
+      handleUiTestTouch(x, y);
+      break;
+    case UiPage::ACCESS:
+      handleUiAccessTouch(x, y);
+      break;
+    case UiPage::PEERS:
+      handleUiPeersTouch(x, y);
+      break;
+    case UiPage::RESULTS:
+      break;
+  }
+}
+
+void pollTouch() {
+  if (!touchReady || static_cast<uint32_t>(millis() - lastTouchPollAt) < 25UL) {
+    return;
+  }
+  lastTouchPollAt = millis();
+
+  int16_t x = 0;
+  int16_t y = 0;
+  const bool pressed = nessoTouch.read(x, y);
+  if (pressed && !previousTouchPressed && x >= 0 && x < UI_WIDTH && y >= 0 && y < 135) {
+    handleUiTouch(x, y);
+  }
+  previousTouchPressed = pressed;
+}
+
+void runUiRefreshTask() {
+  if (!displayReady) {
+    return;
+  }
+  if (uiNotice.length() && timeReached(millis(), uiNoticeUntil)) {
+    uiNotice = "";
+    redrawDisplay();
+    return;
+  }
+
+  const uint32_t refreshInterval = benchmark.active || profileSweep.active || pendingRadioConfiguration.active ? 1000UL : 15000UL;
+  if (static_cast<uint32_t>(millis() - lastUiRefreshAt) >= refreshInterval) {
+    redrawDisplay();
+  }
+}
+
 void pollButtons() {
   const bool key1Pressed = digitalRead(KEY1) == LOW;
-  const bool key2Pressed = digitalRead(KEY2) == LOW;
   const uint32_t now = millis();
 
   if (now - lastButtonEvent >= 250) {
     if (key1Pressed && !previousKey1Pressed) {
       lastButtonEvent = now;
-      sendText(String("Button A from ") + nodeId);
-    } else if (key2Pressed && !previousKey2Pressed) {
-      lastButtonEvent = now;
-      sendTelemetry();
+      if (uiConfirmationActive) {
+        applyUiRadioChange();
+      } else if (uiPage == UiPage::HOME) {
+        setUiNotice(sendPing() ? "Ping sent" : "Ping blocked");
+      } else {
+        uiPage = UiPage::HOME;
+        redrawDisplay();
+      }
     }
   }
 
   previousKey1Pressed = key1Pressed;
-  previousKey2Pressed = key2Pressed;
 }
 
 void runPeriodicTasks() {
@@ -2455,9 +3827,12 @@ void setup() {
   }
 
   makeNodeId();
+  loadPersistentConfiguration();
   setupNessoIo();
   setupDisplay();
   setupRadio();
+  setupRemoteHttpApi();
+  setupRemoteBleApi();
 
   Serial.println();
   Serial.println(F("Arduino Nesso N1 LoRa exerciser"));
@@ -2478,7 +3853,9 @@ void setup() {
 void loop() {
   pollRadio();
   pollSerial();
+  pollRemoteCommandApi();
   pollButtons();
+  pollTouch();
   runDeferredPacketTask();
   retryPendingText();
   runBenchmarkTask();
@@ -2487,5 +3864,6 @@ void loop() {
   runOutgoingTransferTask();
   runIncomingTransferMaintenance();
   runPeriodicTasks();
+  runUiRefreshTask();
   delay(2);
 }
