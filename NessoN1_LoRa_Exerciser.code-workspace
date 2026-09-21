@@ -1,0 +1,18 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"arduino.useArduinoCli": true,
+		"arduino.path": "C:\\Program Files\\Arduino CLI",
+		"arduino.commandPath": "arduino-cli.exe",
+		"arduino.additionalUrls": [
+			"https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+		],
+		"files.associations": {
+			"*.ino": "cpp"
+		}
+	}
+}

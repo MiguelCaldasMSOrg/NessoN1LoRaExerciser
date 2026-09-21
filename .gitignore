@@ -1,13 +1,25 @@
-# Local editor configuration
-.vscode/
-*.code-workspace
+# VS Code generated files
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/
 
 # Arduino build output
 build/
-*.bin
+Build/
+build-*/
+*.d
+*.o
+*.obj
+*.a
 *.elf
+*.bin
 *.hex
 *.map
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+*.swp
 
 # OS metadata
 .DS_Store

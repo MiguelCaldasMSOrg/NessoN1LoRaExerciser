@@ -1,0 +1,45 @@
+{
+    "arduino.useArduinoCli": true,
+    "arduino.path": "C:\\Program Files\\Arduino CLI",
+    "arduino.commandPath": "arduino-cli.exe",
+    "arduino.additionalUrls": [
+        "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+    ],
+    "files.associations": {
+        "*.ino": "cpp"
+    },
+    "C_Cpp.default.compilerPath": "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\tools\\esp-rv32\\2601\\bin\\riscv32-esp-elf-g++.exe",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/../NessoN1_LoRa_Exerciser-build/compile_commands.json",
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}",
+        "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\tools\\esp32c6-libs\\3.3.11\\include\\**",
+        "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\tools\\esp32c6-libs\\3.3.11\\qio_qspi\\include",
+        "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\hardware\\esp32\\3.3.11\\cores\\esp32",
+        "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\hardware\\esp32\\3.3.11\\variants\\arduino_nesso_n1",
+        "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\hardware\\esp32\\3.3.11\\libraries\\SPI\\src",
+        "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\hardware\\esp32\\3.3.11\\libraries\\Wire\\src",
+        "C:\\Projects\\Arduino\\Support\\sketchbook\\libraries\\RadioLib\\src",
+        "C:\\Projects\\Arduino\\Support\\sketchbook\\libraries\\Arduino_Nesso_N1\\src",
+        "C:\\Projects\\Arduino\\Support\\sketchbook\\libraries\\M5GFX\\src",
+        "C:\\Projects\\Arduino\\Support\\sketchbook\\libraries\\Arduino_BMI270_BMM150\\src"
+    ],
+    "C_Cpp.default.forcedInclude": [
+        "C:\\Projects\\Arduino\\Support\\data\\packages\\esp32\\hardware\\esp32\\3.3.11\\cores\\esp32\\Arduino.h"
+    ],
+    "C_Cpp.default.defines": [
+        "F_CPU=160000000L",
+        "ARDUINO=10607",
+        "ARDUINO_ARDUINO_NESSO_N1",
+        "ARDUINO_ARCH_ESP32",
+        "ARDUINO_BOARD=\"ARDUINO_NESSO_N1\"",
+        "ARDUINO_VARIANT=\"arduino_nesso_n1\"",
+        "ARDUINO_PARTITION_app3M_fat9M_16MB",
+        "ESP32=ESP32",
+        "ESP_PLATFORM",
+        "ARDUINO_USB_MODE=1",
+        "ARDUINO_USB_CDC_ON_BOOT=1"
+    ],
+    "C_Cpp.default.cStandard": "gnu17",
+    "C_Cpp.default.cppStandard": "gnu++20",
+    "C_Cpp.intelliSenseEngine": "default"
+}
