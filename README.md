@@ -4,6 +4,8 @@ An Arduino sketch for exercising the SX1262 LoRa radio on two Nesso N1 boards. F
 
 All sketch behavior and radio settings are contained in `NessoN1_LoRa_Exerciser.ino`. The repository's VS Code and GitHub configuration is optional; the sketch can be opened and uploaded directly with the Arduino IDE once the board support and required libraries are installed.
 
+See [FEATURES.md](FEATURES.md) for a complete introduction to LoRa and GFSK concepts, every exerciser feature and command, protocol behavior, limits, diagnostics, and guided experiments.
+
 ## Features
 
 - Automatic peer discovery with periodic `HELLO` packets
