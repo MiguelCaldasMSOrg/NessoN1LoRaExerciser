@@ -17,6 +17,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Run firmware regression checks
+        shell: bash
+        run: python3 tests/regressions.py
+
       - name: Install and run Arduino Lint
         shell: bash
         env:

@@ -275,18 +275,18 @@ The input buffer holds approximately 1,232 characters so that a maximum-length t
 
 ### Buttons
 
-Only the accessible front button is polled. It is edge-triggered with a 250-millisecond debounce interval.
+Both user buttons are polled. The front button is edge-triggered with a 250-millisecond debounce interval, while the side button requires a continuous three-second hold to prevent accidental shutdown.
 
 | Button | Action |
 | --- | --- |
 | Front `KEY1` | Ping while Home is visible, apply an on-screen radio confirmation, or return to Home from another page |
-| Side `KEY2` | Intentionally unused because it is difficult to operate in the enclosure |
+| Side `KEY2` | Hold continuously for three seconds to power off the board; release early to cancel |
 
-The front-button ping obeys the same transmit-access controls as a serial `p` command.
+The front-button ping obeys the same transmit-access controls as a serial `p` command. A completed side-button hold blanks the display, stops Wi-Fi and BLE, sleeps the radio, and disables the radio path. The Nesso's `POWEROFF` signal goes to a programmed power controller, not a simple level-controlled latch: shutdown sends five low/high pulses with 50 ms per level, following [M5Stack's Nesso implementation](https://github.com/m5stack/M5Unified/blob/master/src/utility/Power_Class.inl). Holding that signal continuously high can reset rather than power off the board. If power remains, the CPU enters deep sleep with all wake sources disabled. The separate hardware power button switches the board on again.
 
 ### Touchscreen
 
-The 240-by-135 landscape touchscreen is the primary disconnected interface. A persistent bottom navigation bar selects five pages:
+The 240-by-135 landscape touchscreen is the primary disconnected interface. Raw portrait touch coordinates are swapped and inverted before landscape hit-testing. Every page header includes a tiny battery gauge and charge percentage. The cached native BQ27220 state-of-charge reading is refreshed once per minute; cyan indicates charging, yellow or red indicates low charge, and green indicates normal charge. Gray `--%` means no valid sample, and a gray percentage with `!` marks a last-good sample that is stale after a failed read or two minutes without a successful refresh. Serial status reports the sample age; HTTP status exposes freshness and uses `null` for stale numeric values. A persistent bottom navigation bar selects five pages:
 
 | Page | Controls and information |
 | --- | --- |
@@ -409,6 +409,7 @@ Normal sketch uploads preserve Non-Volatile Storage because erase-all is disable
 | `slots on`, `slots off`, or `slots sync` | Control local or synchronized eight-slot access |
 | `survey` | Survey five frequencies around the active center frequency |
 | `survey <startMHz> <endMHz> <stepKHz> <samples>` | Run a custom receive survey |
+| `survey stop` | Cancel the survey and restore the configured frequency and receive mode |
 | `diag` | Print SX1262 and application diagnostics as comma-separated values |
 | `diag clear` | Clear latched SX1262 device-error bits |
 | `diag calibrate` | Run SX1262 image calibration for the active frequency |
@@ -629,7 +630,7 @@ The setting applies to both LoRa and GFSK.
 
 `header explicit` uses an on-air LoRa header that lets the receiver learn packet parameters including payload length. This is the startup default and supports variable frame lengths.
 
-`header implicit <bytes>` removes the explicit header and configures a fixed expected length from 24 through 220 bytes. The sender pads a shorter custom frame with spaces to the exact length. A frame longer than the configured implicit length is rejected. Received trailing padding is removed when the raw text is trimmed.
+`header implicit <bytes>` removes the explicit header and configures a fixed expected length from 24 through 220 bytes. The sender pads a shorter custom frame with zero bytes to the exact length and uses RadioLib's byte-buffer transmit API. A frame longer than the configured implicit length is rejected. The received text ends at the first zero byte, preserving legitimate trailing spaces in fragment data. Both boards must run this framing version; older space-padded implicit packets are not supported.
 
 Both boards must configure the same fixed length. Implicit mode can reduce overhead, but it is inconvenient for variable-length text and easy to misconfigure.
 
@@ -897,7 +898,7 @@ frequency_mhz,average_rssi_dbm,lora_detections,samples
 
 `average_rssi_dbm` is a short receive-power sample, not a calibrated spectrum-analyzer trace. `lora_detections` counts compatible LoRa preamble detections, not all channel users. Step size does not change the receiver bandwidth, so adjacent samples can overlap heavily.
 
-The survey is blocking: normal packet processing pauses while it runs. At completion, the sketch restores the active profile frequency and configured receive mode. A survey range accepted by the hardware is not necessarily a legal transmit range.
+The survey advances incrementally through frequency tuning, RSSI sampling, and deadline-bounded CAD. Touch, buttons, serial, and remote commands remain serviced; normal radio packet delivery pauses because the transceiver is scanning. Use `survey stop` or Stop on the Test page to cancel. Completion, cancellation, and timeout restore the active profile frequency and configured receive mode. A survey range accepted by the hardware is not necessarily a legal transmit range.
 
 ## Radio and Link Diagnostics
 
@@ -945,7 +946,7 @@ This transfer checksum is independent of the SX1262 packet CRC. The packet CRC p
 
 ### Selective Acknowledgement
 
-After every valid fragment, the receiver returns a `K` packet with a 16-bit bitmap. Bit `N` is set when fragment `N` has arrived. The sender merges received bitmaps and sends only fragments whose bits remain clear.
+After each incomplete valid fragment, the receiver returns a `K` packet with a 16-bit bitmap. Bit `N` is set when fragment `N` has arrived. A complete bitmap is sent only after whole-message CRC validation. The sender adopts the newest cumulative snapshot, rejects older or duplicate acknowledgement sequence numbers, and sends only fragments whose bits remain clear. A zero bitmap after a CRC failure resets the sender's progress instead of being merged with older acknowledgements.
 
 When a complete round has been sent, the sender waits 1.8 seconds for acknowledgement progress. It performs at most five rounds. If fragments are still missing, the transfer is paused rather than discarded.
 
@@ -963,7 +964,7 @@ When a complete round has been sent, the sender waits 1.8 seconds for acknowledg
 
 The receiver holds one incomplete transfer at a time. A conflicting transfer from another source is rejected while the current one remains incomplete and has not expired. An incomplete transfer expires 30 seconds after its last accepted fragment.
 
-When every bit is present, fragments are concatenated in index order and the whole-message checksum is verified. On mismatch, the receive bitmap is cleared so the sender can retransmit. On success, the full text is printed and a clipped form is shown on the display.
+When every bit is present, fragments are concatenated in index order and the whole-message checksum is verified. On mismatch, the receive bitmap is cleared and a zero-bitmap acknowledgement requests retransmission. No complete acknowledgement is sent for a bad checksum. On success, the complete bitmap is acknowledged, the full text is printed, and a clipped form is shown on the display. Fragment boundaries preserve spaces and other text whitespace.
 
 If the initial destination was broadcast, the first valid transfer acknowledgement binds the outgoing transfer to that responder. The operation is therefore one-to-one after binding, not reliable multicast.
 
@@ -1014,19 +1015,13 @@ After a record expires or is overwritten, a delayed duplicate could be forwarded
 
 ## Feature Interaction and Concurrency
 
-The main loop checks radio reception, serial input, queued HTTP/Bluetooth commands, the HTTP server, touch, the front button, deferred replies, text retries, benchmark state, pending radio changes, sweep state, transfer state, incoming-transfer expiry, and periodic traffic approximately every two milliseconds when no blocking operation is active.
+The cooperative main loop services radio reception, serial input, queued HTTP/Bluetooth commands, touch, both user buttons, incremental surveys, deferred replies, text retries, benchmarks, radio changes, sweeps, transfers, and UI refresh. Its idle delay is two milliseconds; touch and button sampling are capped at one poll per 25 milliseconds.
 
-Some combinations are rejected in code:
+Transmit and CAD waits use RadioLib's nonblocking start APIs with explicit completion deadlines. During those waits, the sketch services inputs, display updates, HTTP ingress, and serial ingress; commands are queued until the current radio operation returns. The radio-operation guard prevents those callbacks from re-entering the radio driver. CAD backoff also services the UI instead of sleeping through the whole interval. Long surveys execute one sample at a time and support cancellation.
 
-| Requested operation | Rejected while |
-| --- | --- |
-| New acknowledged text | Benchmark, sweep, outgoing transfer, or pending radio change is active; or another text awaits acknowledgement |
-| New benchmark | Outgoing transfer or pending radio change is active; or an independent sweep is active |
-| New transfer | Benchmark, sweep, pending radio change, or another outgoing transfer is active |
-| New sweep | Benchmark or pending radio change is active |
-| Periodic hello/telemetry | Benchmark, sweep, pending radio change, or outgoing transfer is active |
+One shared eligibility check protects manual transmissions, benchmarks, sweeps, transfers, surveys, and radio-setting changes across touchscreen, serial, HTTP, BLE, and received synchronized control packets. These operations reject competing benchmarks, sweeps, outgoing or incomplete incoming transfers, pending text acknowledgements, pending radio changes, surveys, and in-progress radio calls. The sweep alone may initiate its own profile changes and benchmarks. Protocol replies and the active exercise's traffic still use the radio's shared access controls. Stop/cancel and status commands remain available; explicit restart, sleep, and physical shutdown remain intentional ways to interrupt the application.
 
-Other commands are not universally locked. Local mode/profile changes, packet-option changes, surveys, sleep, relay traffic, and pings can disrupt an active measurement or transfer. For reproducible results:
+Only an SX1262 `RX_DONE` interrupt permits reading a received packet. TX and CAD completion share the same physical interrupt pin but are not counted or parsed as receptions. For reproducible results:
 
 1. finish or stop the current long-running exercise;
 2. apply compatible settings to all participating boards;

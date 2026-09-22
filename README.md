@@ -14,8 +14,9 @@ See [FEATURES.md](FEATURES.md) for a complete introduction to LoRa and GFSK conc
 - Battery, uptime, charge, and free-heap telemetry
 - RSSI and SNR reporting for received packets
 - LoRa channel-activity detection
-- Touchscreen operation with five action-oriented pages and live results
+- Touchscreen operation with five action-oriented pages, live results, and battery status
 - Front-button shortcuts without requiring a serial connection
+- Three-second side-button hold for complete hardware shutdown
 - Wi-Fi HTTP and Bluetooth Low Energy command APIs
 - Persistent Wi-Fi, Bluetooth, LoRa, packet, and access configuration in NVS
 - Runtime LoRa profiles and synchronized peer switching
@@ -112,7 +113,7 @@ The Arduino extension writes reusable build output to the sibling directory `../
 | `c` | Run LoRa channel-activity detection |
 | `?` or `help` | Print command help |
 | Front `KEY1` | Ping on Home, confirm a pending radio change, or return Home |
-| Side `KEY2` | Intentionally unused |
+| Side `KEY2` | Hold for three seconds to power off the board |
 
 ### Touchscreen Controls
 
@@ -126,7 +127,9 @@ The bottom navigation bar provides five pages:
 | Access | Toggle automatic CAD, 1% duty pacing, synchronized slots, low-power receive, boosted gain, and relay forwarding |
 | Peers | Browse discovered nodes, lock selection to a peer, or return to automatic selection |
 
-Radio changes require an on-screen confirmation. The front button confirms that dialog, pings from Home, and otherwise returns to Home. The side button is not used.
+Radio changes require an on-screen confirmation. The front button confirms that dialog, pings from Home, and otherwise returns to Home. Every page header shows charge percentage and a tiny battery gauge, refreshed once per minute. Cyan indicates charging, yellow or red indicates a low battery, and green indicates normal charge. Gray `--%` means no valid reading; a gray percentage followed by `!` is stale after a failed read or two minutes without a successful refresh. Touch coordinates are rotated to match the landscape display. Holding the side button for three seconds blanks the display and asserts the Nesso N1 hardware power-off control; releasing it early cancels shutdown.
+
+Shutdown sends five low/high pulses, with each level held for 50 ms, to the Nesso power controller. This replaces holding `POWEROFF` continuously high, which can reset the board instead. Wi-Fi, BLE, the display backlight, and the radio are stopped first. If the controller leaves the CPU powered, the fallback is deep sleep with all wake sources disabled, not an automatic restart. Use the separate physical power button to switch the board on again.
 
 ### Radio And Packet Controls
 
@@ -173,11 +176,14 @@ The fixed 1.2-second transmit interval always remains active. The percentage sup
 | `sweep stop` | Stop the current sweep |
 | `survey` | Survey five channels centered on the active frequency |
 | `survey <startMHz> <endMHz> <stepKHz> <samples>` | Survey up to 200 channels and print CSV |
+| `survey stop` | Cancel the survey and restore the active frequency and receive mode |
 | `diag` | Print SX1262 and link diagnostics as CSV |
 | `diag clear` | Clear SX1262 device errors |
 | `diag calibrate` | Run SX1262 image calibration at the active frequency |
 
 Benchmark output includes send attempts, send failures, delivered replies, delivery percentage, minimum/average/maximum RTT, average RSSI and SNR, throughput, and transmit airtime. A broadcast benchmark binds to its first responder so results never combine multiple links.
+
+Surveys advance one sample at a time; the Test page's Stop control also cancels them. Transmit, CAD, and backoff waits have deadlines and service screen/input work and command ingress. Serial/HTTP/BLE commands received during those waits are queued until the radio operation finishes. Conflicting exercises, profile changes, and packet/access settings use shared exclusion checks regardless of input transport; status and explicit stop/cancel commands remain available.
 
 ### Peers, Transfers, And Relaying
 
@@ -194,6 +200,8 @@ Benchmark output includes send attempts, send failures, delivered replies, deliv
 | `relay send <node-id\|*> <1-8 hops> <text>` | Send a bounded broadcast relay message |
 
 Transfers use up to 16 fragments of 72 bytes, a CRC-16 over the complete text, selective acknowledgement bitmaps, five automatic transmission rounds, and a 30-second receiver timeout. Relay nodes remember 16 message IDs for two minutes to suppress duplicates and loops.
+
+A complete transfer is acknowledged only after CRC validation. A failed CRC sends a zero bitmap so the sender retries every fragment; acknowledgement sequence numbers reject stale snapshots. Fragment whitespace is preserved. Implicit packets are padded with zero bytes instead of spaces, so both peers must run this version when using implicit mode.
 
 ### Persistent Configuration
 
@@ -281,6 +289,8 @@ This initial laboratory API uses a shared fixed password for the recovery AP and
 
 The default profile is intended for EU868 testing. Before transmitting, set the frequency and power to values permitted in your region and observe all applicable duty-cycle requirements.
 
+`LORA_FREQUENCY_MHZ` sets every profile's frequency. `LORA_TX_POWER_DBM` is the profile power ceiling (`fast` is additionally capped at 10 dBm, `maximum-range` at 14 dBm). The other named LoRa defaults configure the `default` profile; the alternative profiles retain their documented modulation settings.
+
 ## LoRa Profiles
 
 | Name | Frequency | Bandwidth | Spreading factor | Coding rate | TX power | Preamble |
@@ -335,7 +345,9 @@ Protocol acknowledgements and replies that encounter the transmit guard are queu
 
 ## Automation
 
-The GitHub Actions workflow runs Arduino Lint in strict sketch mode and compiles the sketch for `esp32:esp32:arduino_nesso_n1` on pushes to `master`, pull requests, and manual dispatches. The workflow installs the pinned board core and library versions listed above.
+The GitHub Actions workflow runs firmware regressions, Arduino Lint in strict sketch mode, and a compile for `esp32:esp32:arduino_nesso_n1` on pushes to `master`, pull requests, and manual dispatches. The workflow installs the pinned board core and library versions listed above.
+
+Run the host regressions with `python tests/regressions.py` (Python 3 and a C++17 `g++` or `clang++` compiler are required; `CXX` can select the compiler). They compile actual sketch functions against simulated touch, radio, serial, and I2C hardware to check coordinate rotation, IRQ classification, transfer integrity, shared guards, timeout responsiveness, survey cancellation, and battery freshness. They complement, but do not replace, tests on physical boards.
 
 ## License
 

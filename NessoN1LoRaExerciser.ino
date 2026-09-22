@@ -110,6 +110,8 @@
           Control or synchronize eight 250 ms transmit slots
     survey [startMHz endMHz stepKHz samples]
           Measure RSSI and LoRa detections on up to 200 channels as CSV
+        survey stop
+          Cancel the survey and restore the configured receive mode
     diag | diag clear | diag calibrate
           Print, clear, or calibrate SX1262 diagnostics
     sleep <seconds>
@@ -141,9 +143,10 @@
 
   Buttons:
     KEY1      Ping from Home, confirm a radio change, or return Home
-    KEY2      Unused because the side button is difficult to operate
+    KEY2      Hold for three seconds to power off the board
 
   Touchscreen:
+    Header    Show battery charge, updated once per minute
     Home      Send HELLO, ping, preset text, or telemetry
     Radio     Synchronize modulation and LoRa profile changes
     Test      Run CAD, a benchmark, a profile sweep, or inspect results
@@ -287,6 +290,14 @@ constexpr size_t MAX_PACKET_LENGTH = 220;
 constexpr uint32_t TX_MIN_INTERVAL_MS = 1200;
 constexpr uint32_t HELLO_INTERVAL_MS = 25000;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 60000;
+constexpr uint32_t BATTERY_STATUS_INTERVAL_MS = 60000;
+constexpr uint32_t BATTERY_STALE_AFTER_MS = 2 * BATTERY_STATUS_INTERVAL_MS;
+constexpr uint32_t POWER_OFF_HOLD_MS = 3000;
+constexpr uint32_t POWER_OFF_PULSE_MS = 50;
+constexpr uint8_t POWER_OFF_PULSE_STEPS = 10;
+constexpr uint32_t INPUT_POLL_INTERVAL_MS = 25;
+constexpr uint32_t TOUCH_SETTLE_MS = 25;
+constexpr uint16_t I2C_TRANSACTION_TIMEOUT_MS = 20;
 constexpr uint32_t ACK_TIMEOUT_MS = 3500;
 constexpr uint8_t MAX_TEXT_ATTEMPTS = 3;
 
@@ -314,6 +325,16 @@ enum class RadioMode : uint8_t {
   FSK
 };
 
+enum class UserOperation : uint8_t {
+  TRANSMIT,
+  CONFIGURE,
+  BENCHMARK,
+  SWEEP,
+  TRANSFER,
+  SCAN,
+  SURVEY
+};
+
 struct LoRaProfile {
   const char* name;
   float frequencyMHz;
@@ -325,10 +346,10 @@ struct LoRaProfile {
 };
 
 constexpr LoRaProfile LORA_PROFILES[] = {
-  { "default", 868.1f, 125.0f, 7, 5, 14, 8 },
-  { "fast", 868.1f, 250.0f, 7, 5, 10, 8 },
-  { "robust", 868.1f, 125.0f, 10, 5, 14, 12 },
-  { "maximum-range", 868.1f, 125.0f, 12, 8, 14, 16 }
+  { "default", LORA_FREQUENCY_MHZ, LORA_BANDWIDTH_KHZ, LORA_SPREADING_FACTOR, LORA_CODING_RATE, LORA_TX_POWER_DBM, LORA_PREAMBLE_SYMBOLS },
+  { "fast", LORA_FREQUENCY_MHZ, 250.0f, 7, 5, LORA_TX_POWER_DBM < 10 ? LORA_TX_POWER_DBM : 10, 8 },
+  { "robust", LORA_FREQUENCY_MHZ, 125.0f, 10, 5, LORA_TX_POWER_DBM, 12 },
+  { "maximum-range", LORA_FREQUENCY_MHZ, 125.0f, 12, 8, 14 > LORA_TX_POWER_DBM ? LORA_TX_POWER_DBM : 14, 16 }
 };
 constexpr size_t LORA_PROFILE_COUNT = sizeof(LORA_PROFILES) / sizeof(LORA_PROFILES[0]);
 
@@ -447,6 +468,8 @@ struct OutgoingTransfer {
   String data;
   uint16_t checksum = 0;
   uint16_t acknowledgedMask = 0;
+  uint32_t lastAcknowledgementSequence = 0;
+  bool haveAcknowledgementSequence = false;
   uint8_t fragmentCount = 0;
   uint8_t attempts = 0;
   uint8_t nextFragmentIndex = 0;
@@ -506,6 +529,25 @@ struct ProfileSweepState {
   bool returningToDefault = false;
 };
 
+enum class SurveyPhase : uint8_t {
+  TUNE,
+  SAMPLE_RSSI,
+  WAIT_CAD
+};
+
+struct ChannelSurveyState {
+  SurveyPhase phase = SurveyPhase::TUNE;
+  float startMHz = 0.0f;
+  float stepKHz = 0.0f;
+  float totalRssi = 0.0f;
+  uint16_t channelIndex = 0;
+  uint16_t channelCount = 0;
+  uint8_t samples = 0;
+  uint8_t sampleIndex = 0;
+  uint8_t detections = 0;
+  uint32_t nextActionAt = 0;
+};
+
 enum class UiPage : uint8_t {
   HOME,
   RADIO,
@@ -517,6 +559,8 @@ enum class UiPage : uint8_t {
 
 volatile bool packetReceivedFlag = false;
 bool radioReady = false;
+bool radioOperationBusy = false;
+bool channelSurveyActive = false;
 bool displayReady = false;
 bool touchReady = false;
 RadioMode radioMode = RadioMode::LORA;
@@ -552,7 +596,18 @@ String uiNotice;
 uint32_t uiNoticeUntil = 0;
 uint32_t lastUiRefreshAt = 0;
 uint32_t lastTouchPollAt = 0;
+uint32_t lastButtonPollAt = 0;
+uint32_t touchPressedAt = 0;
 bool previousTouchPressed = false;
+bool touchHandled = false;
+float batteryVoltage = 0.0f;
+uint16_t batteryChargeLevel = 0;
+NessoBattery::ChargeStatus batteryChargeStatus = NessoBattery::NOT_CHARGING;
+uint32_t lastBatteryStatusAt = 0;
+uint32_t lastBatterySuccessAt = 0;
+bool batteryStatusReady = false;
+bool batteryReadSucceeded = false;
+bool batteryChargeStatusReady = false;
 uint8_t uiPeerPage = 0;
 bool benchmarkResultAvailable = false;
 String benchmarkResultReason;
@@ -592,6 +647,7 @@ RelayRecord relayHistory[MAX_RELAY_HISTORY];
 uint8_t relayHistoryNext = 0;
 PendingRadioConfiguration pendingRadioConfiguration;
 ProfileSweepState profileSweep;
+ChannelSurveyState channelSurvey;
 DeferredPacket deferredPackets[DEFERRED_PACKET_COUNT];
 
 char nodeId[9] = {};
@@ -619,7 +675,10 @@ uint32_t pendingTextLastAttempt = 0;
 float lastReceivedRssi = 0.0f;
 float lastReceivedSnr = 0.0f;
 uint32_t lastButtonEvent = 0;
+uint32_t key2PressedAt = 0;
 bool previousKey1Pressed = false;
+bool previousKey2Pressed = false;
+bool key2PowerOffArmed = false;
 
 struct ReceivedPacket {
   char type = 0;
@@ -629,12 +688,30 @@ struct ReceivedPacket {
   String body;
 };
 
+class RadioOperationScope {
+public:
+  RadioOperationScope() : wasBusy(radioOperationBusy) {
+    radioOperationBusy = true;
+  }
+  ~RadioOperationScope() {
+    radioOperationBusy = wasBusy;
+  }
+private:
+  bool wasBusy;
+};
+
 void onRadioPacketReceived() {
   packetReceivedFlag = true;
 }
 
 bool timeReached(uint32_t now, uint32_t deadline) {
   return static_cast<int32_t>(now - deadline) >= 0;
+}
+
+bool operationAllowed(UserOperation operation, bool startedBySweep = false) {
+  const bool receivingTransfer = incomingTransfer.active && incomingTransfer.receivedMask != completeFragmentMask(incomingTransfer.fragmentCount) && !timeReached(millis(), incomingTransfer.lastUpdateAt + INCOMING_TRANSFER_TIMEOUT_MS);
+  const bool sweepTransition = startedBySweep && (operation == UserOperation::CONFIGURE || operation == UserOperation::BENCHMARK);
+  return (radioReady || operation == UserOperation::CONFIGURE) && !radioOperationBusy && !channelSurveyActive && !benchmark.active && !outgoingTransfer.active && !pendingRadioConfiguration.active && !pendingTextActive && !receivingTransfer && (!profileSweep.active || sweepTransition);
 }
 
 const LoRaProfile& activeLoRaProfile() {
@@ -953,6 +1030,18 @@ String remoteStatusJson() {
   appendJsonEscaped(json, lastRemoteCommandSource);
   json += F("\",\"last_command_ms\":");
   json += lastRemoteCommandAt;
+  json += F(",\"battery_state\":\"");
+  json += batteryDataState();
+  json += F("\",\"battery_percent\":");
+  json += batteryStatusFresh() ? String(batteryChargeLevel) : String("null");
+  json += F(",\"battery_voltage\":");
+  json += batteryStatusFresh() ? String(batteryVoltage, 3) : String("null");
+  json += F(",\"battery_age_ms\":");
+  json += batteryStatusReady ? String(static_cast<uint32_t>(millis() - lastBatterySuccessAt)) : String("null");
+  json += F(",\"battery_charging\":");
+  json += !batteryStatusFresh() || !batteryChargeStatusReady ? "null" : (batteryChargeStatus == NessoBattery::PRE_CHARGE || batteryChargeStatus == NessoBattery::CHARGING ? "true" : "false");
+  json += F(",\"survey_active\":");
+  json += channelSurveyActive ? "true" : "false";
   json += '}';
   return json;
 }
@@ -1212,6 +1301,7 @@ String clipped(const String& value, size_t maxLength) {
 }
 
 constexpr int16_t UI_WIDTH = 240;
+constexpr int16_t UI_HEIGHT = 135;
 constexpr int16_t UI_HEADER_HEIGHT = 20;
 constexpr int16_t UI_NAV_Y = 113;
 constexpr int16_t UI_NAV_HEIGHT = 22;
@@ -1238,9 +1328,94 @@ void drawUiButton(int16_t x, int16_t y, int16_t width, int16_t height, const Str
   drawUiText(label, x + width / 2, y + height / 2, active ? COLOR_GREEN : COLOR_WHITE, MC_DATUM, textSize);
 }
 
+bool readI2cRegister(uint8_t address, uint8_t registerAddress, uint8_t* data, size_t length) {
+  Wire.beginTransmission(address);
+  Wire.write(registerAddress);
+  if (Wire.endTransmission() != 0 || Wire.requestFrom(address, length) != length) {
+    while (Wire.available() > 0) {
+      Wire.read();
+    }
+    return false;
+  }
+
+  for (size_t index = 0; index < length; ++index) {
+    data[index] = static_cast<uint8_t>(Wire.read());
+  }
+  return true;
+}
+
+bool readI2cWord(uint8_t address, uint8_t registerAddress, uint16_t& value) {
+  uint8_t data[2] = {};
+  if (!readI2cRegister(address, registerAddress, data, sizeof(data))) {
+    return false;
+  }
+  value = static_cast<uint16_t>(data[0]) | static_cast<uint16_t>(data[1]) << 8;
+  return true;
+}
+
+bool batteryStatusFresh() {
+  return batteryStatusReady && batteryReadSucceeded && static_cast<uint32_t>(millis() - lastBatterySuccessAt) < BATTERY_STALE_AFTER_MS;
+}
+
+const char* batteryDataState() {
+  return !batteryStatusReady ? "unavailable" : (batteryStatusFresh() ? "fresh" : "stale");
+}
+
+bool updateBatteryStatus(bool force = false) {
+  const uint32_t now = millis();
+  if (!force && static_cast<uint32_t>(now - lastBatteryStatusAt) < BATTERY_STATUS_INTERVAL_MS) {
+    return false;
+  }
+
+  uint16_t voltageMillivolts = 0;
+  uint16_t stateOfCharge = 0;
+  uint8_t chargerSystemStatus = 0;
+  const bool voltageRead = readI2cWord(NessoBattery::BQ27220_I2C_ADDR, NessoBattery::BQ27220_VOLTAGE, voltageMillivolts);
+  const bool chargeRead = readI2cWord(NessoBattery::BQ27220_I2C_ADDR, 0x2C, stateOfCharge);
+  const bool statusRead = readI2cRegister(NessoBattery::AW32001_I2C_ADDR, NessoBattery::AW3200_SYS_STATUS, &chargerSystemStatus, 1);
+  lastBatteryStatusAt = now;
+  batteryReadSucceeded = voltageRead && chargeRead && stateOfCharge <= 100 && voltageMillivolts >= 2000 && voltageMillivolts <= 4500;
+  batteryChargeStatusReady = statusRead;
+
+  if (!batteryReadSucceeded) {
+    return true;
+  }
+
+  batteryVoltage = static_cast<float>(voltageMillivolts) / 1000.0f;
+  batteryChargeLevel = stateOfCharge;
+  if (statusRead) {
+    batteryChargeStatus = static_cast<NessoBattery::ChargeStatus>((chargerSystemStatus >> 3) & 0x03);
+  }
+  batteryStatusReady = true;
+  lastBatterySuccessAt = now;
+  return true;
+}
+
+void drawBatteryIndicator() {
+  constexpr int16_t batteryX = 165;
+  constexpr int16_t batteryY = 6;
+  constexpr int16_t batteryWidth = 14;
+  constexpr int16_t batteryHeight = 8;
+  const bool fresh = batteryStatusFresh();
+  uint16_t color = !fresh ? COLOR_GRAY : (batteryChargeLevel <= 15 ? COLOR_RED : (batteryChargeLevel <= 40 ? COLOR_YELLOW : COLOR_GREEN));
+  if (fresh && batteryChargeStatusReady && (batteryChargeStatus == NessoBattery::PRE_CHARGE || batteryChargeStatus == NessoBattery::CHARGING)) {
+    color = COLOR_CYAN;
+  }
+
+  const String label = !batteryStatusReady ? String("--%") : String(batteryChargeLevel) + (fresh ? "%" : "%!");
+  drawUiText(label, batteryX - 4, UI_HEADER_HEIGHT / 2, color, MR_DATUM);
+  nessoDisplay.drawRect(batteryX, batteryY, batteryWidth, batteryHeight, color);
+  nessoDisplay.fillRect(batteryX + batteryWidth, batteryY + 2, 2, batteryHeight - 4, color);
+  const int16_t fillWidth = static_cast<int16_t>((batteryWidth - 2) * batteryChargeLevel / 100);
+  if (fillWidth > 0) {
+    nessoDisplay.fillRect(batteryX + 1, batteryY + 1, fillWidth, batteryHeight - 2, color);
+  }
+}
+
 void drawUiHeader(const String& title) {
   nessoDisplay.fillRect(0, 0, UI_WIDTH, UI_HEADER_HEIGHT, COLOR_DARK);
   drawUiText(title, 4, UI_HEADER_HEIGHT / 2, COLOR_CYAN, ML_DATUM);
+  drawBatteryIndicator();
   drawUiText(nodeId, UI_WIDTH - 4, UI_HEADER_HEIGHT / 2, COLOR_WHITE, MR_DATUM);
 }
 
@@ -1302,10 +1477,12 @@ void drawTestPage() {
   drawUiButton(3, 23, 115, 35, "CAD", false, 2);
   drawUiButton(122, 23, 115, 35, "BENCH 10", benchmark.active, 2);
   drawUiButton(3, 62, 115, 35, "SWEEP 5", profileSweep.active, 2);
-  drawUiButton(122, 62, 115, 35, benchmark.active || profileSweep.active ? "STOP" : "RESULTS", false, 2);
+  drawUiButton(122, 62, 115, 35, benchmark.active || profileSweep.active || channelSurveyActive ? "STOP" : "RESULTS", false, 2);
 
   String status = "Ready";
-  if (profileSweep.active) {
+  if (channelSurveyActive) {
+    status = String("Survey ") + String(channelSurvey.channelIndex + 1) + '/' + String(channelSurvey.channelCount);
+  } else if (profileSweep.active) {
     status = String("Sweep ") + String(profileSweep.profileIndex + 1) + '/' + String(LORA_PROFILE_COUNT);
   } else if (benchmark.active) {
     status = String("Benchmark ") + String(benchmark.sentPackets) + '/' + String(benchmark.requestedPackets) + " RX " + String(benchmark.receivedReplies);
@@ -1527,6 +1704,51 @@ int initializeActiveRadio() {
   return state;
 }
 
+void serviceRadioWait() {
+  pollSerial();
+  pollRemoteCommandApi();
+  pollButtons();
+  pollTouch();
+  runUiRefreshTask();
+  delay(1);
+}
+
+bool waitForRadioEvent(uint16_t irqMask, uint32_t timeoutMs) {
+  const uint32_t startedAt = millis();
+  while (static_cast<uint32_t>(millis() - startedAt) < timeoutMs) {
+    if (digitalRead(LORA_IRQ) == HIGH && (radio.getIrqFlags() & irqMask) != 0) {
+      return true;
+    }
+    serviceRadioWait();
+  }
+  return false;
+}
+
+uint32_t channelScanTimeoutMs() {
+  const LoRaProfile& profile = activeLoRaProfile();
+  return 100UL + static_cast<uint32_t>(ceilf(16.0f * (1UL << profile.spreadingFactor) / profile.bandwidthKHz));
+}
+
+int scanChannelResponsive() {
+  RadioOperationScope operation;
+  const int state = radio.startChannelScan();
+  if (state != RADIOLIB_ERR_NONE) {
+    return state;
+  }
+  if (!waitForRadioEvent(RADIOLIB_SX126X_IRQ_CAD_DONE, channelScanTimeoutMs())) {
+    radio.standby();
+    return RADIOLIB_ERR_RX_TIMEOUT;
+  }
+  return radio.getChannelScanResult();
+}
+
+void radioBackoff(uint32_t durationMs) {
+  const uint32_t startedAt = millis();
+  while (static_cast<uint32_t>(millis() - startedAt) < durationMs) {
+    serviceRadioWait();
+  }
+}
+
 bool waitForTransmitAccess() {
   // Every transmit path shares these guards so benchmark, transfer, relay,
   // acknowledgement, and interactive traffic obey the same constraints.
@@ -1565,18 +1787,19 @@ bool waitForTransmitAccess() {
       return false;
     }
 
-    const int scanState = radio.scanChannel();
+    const int scanState = scanChannelResponsive();
     if (scanState == RADIOLIB_CHANNEL_FREE) {
       return true;
     }
-    if (scanState != RADIOLIB_PREAMBLE_DETECTED) {
+    if (scanState != RADIOLIB_LORA_DETECTED) {
       printRadioError("automatic CAD", scanState);
+      startConfiguredReceive();
       return false;
     }
 
     ++cadBusyDetections;
     const uint32_t maximumSlots = (1UL << min<uint8_t>(attempt + 1, 5)) - 1UL;
-    delay(random(maximumSlots + 1UL) * CSMA_SLOT_MS);
+    radioBackoff(random(maximumSlots + 1UL) * CSMA_SLOT_MS);
   }
 
   ++accessDeferrals;
@@ -1612,6 +1835,7 @@ void makeNodeId() {
 void setupNessoIo() {
   Wire.begin(SDA, SCL);
   Wire.setClock(400000);
+  Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
 
   pinMode(KEY1, INPUT_PULLUP);
   pinMode(KEY2, INPUT_PULLUP);
@@ -1655,6 +1879,9 @@ void setupDisplay() {
   nessoDisplay.setRotation(1);
   nessoDisplay.setTextWrap(false);
   redrawDisplay();
+  if (updateBatteryStatus(true)) {
+    redrawDisplay();
+  }
 }
 
 void setupRadio() {
@@ -1716,19 +1943,25 @@ bool isForThisNode(const ReceivedPacket& packet) {
 }
 
 bool sendPacket(char type, const String& destination, const String& body, uint32_t sequence) {
+  if (radioOperationBusy || channelSurveyActive) {
+    return false;
+  }
   if (!radioReady) {
     Serial.println(F("[LoRa] transmit skipped: radio is not ready"));
     return false;
   }
 
+  RadioOperationScope operation;
   if (!waitForTransmitAccess()) {
     Serial.println(F("[Radio] transmit deferred by access controls"));
     return false;
   }
 
   String safeBody = body;
-  safeBody.replace('\r', ' ');
-  safeBody.replace('\n', ' ');
+  if (type != 'F') {
+    safeBody.replace('\r', ' ');
+    safeBody.replace('\n', ' ');
+  }
   safeBody = clipped(safeBody, MAX_BODY_LENGTH);
 
   String payload;
@@ -1755,7 +1988,7 @@ bool sendPacket(char type, const String& destination, const String& body, uint32
       return false;
     }
     while (payload.length() < implicitPacketLength) {
-      payload += ' ';
+      payload += '\0';
     }
   }
 
@@ -1766,7 +1999,17 @@ bool sendPacket(char type, const String& destination, const String& body, uint32
   }
 
   setTransmitting(true);
-  state = radio.transmit(payload);
+  const uint32_t timeoutMs = 100UL + static_cast<uint32_t>((static_cast<uint64_t>(radio.getTimeOnAir(payload.length())) * 5ULL + 999ULL) / 1000ULL);
+  state = radio.startTransmit(reinterpret_cast<const uint8_t*>(payload.c_str()), payload.length());
+  if (state == RADIOLIB_ERR_NONE) {
+    if (!waitForRadioEvent(RADIOLIB_SX126X_IRQ_TX_DONE, timeoutMs)) {
+      state = RADIOLIB_ERR_TX_TIMEOUT;
+    }
+    const int finishState = radio.finishTransmit();
+    if (state == RADIOLIB_ERR_NONE) {
+      state = finishState;
+    }
+  }
   setTransmitting(false);
   lastTxAt = millis();
   if (state == RADIOLIB_ERR_NONE) {
@@ -1861,7 +2104,7 @@ bool sendText(const String& text) {
     Serial.println(F("[LoRa] wait for the previous text acknowledgement"));
     return false;
   }
-  if (benchmark.active || profileSweep.active || outgoingTransfer.active || pendingRadioConfiguration.active) {
+  if (!operationAllowed(UserOperation::TRANSMIT)) {
     Serial.println(F("[LoRa] text is unavailable while another exercise is active"));
     return false;
   }
@@ -1886,32 +2129,40 @@ bool sendText(const String& text) {
 }
 
 bool sendHello() {
+  if (!operationAllowed(UserOperation::TRANSMIT)) {
+    return false;
+  }
   return sendPacket('H', "*", "hello", txSequence++);
 }
 
 bool sendPing() {
+  if (!operationAllowed(UserOperation::TRANSMIT)) {
+    return false;
+  }
   const uint32_t sequence = txSequence++;
   return sendPacket('P', targetPeerOrBroadcast(), "ping", sequence);
 }
 
 String localTelemetry() {
-  const float voltage = nessoBattery.getVoltage();
-  const uint16_t charge = nessoBattery.getChargeLevel();
-
   String body;
   body.reserve(80);
   body += "up=";
   body += String(millis() / 1000UL);
   body += ";vbat=";
-  body += String(voltage, 2);
+  body += batteryStatusFresh() ? String(batteryVoltage, 2) : "unknown";
   body += ";charge=";
-  body += String(charge);
+  body += batteryStatusFresh() ? String(batteryChargeLevel) : "unknown";
+  body += ";battery=";
+  body += batteryDataState();
   body += ";heap=";
   body += String(ESP.getFreeHeap());
   return body;
 }
 
 bool sendTelemetry() {
+  if (!operationAllowed(UserOperation::TRANSMIT)) {
+    return false;
+  }
   const uint32_t sequence = txSequence++;
   const bool sent = sendPacket('S', targetPeerOrBroadcast(), localTelemetry(), sequence);
   if (sent) {
@@ -1969,10 +2220,18 @@ void printStatus() {
   Serial.print(F("Radio:       "));
   Serial.println(radioReady ? "ready" : "not ready");
   Serial.print(F("Battery:     "));
-  Serial.print(nessoBattery.getVoltage(), 2);
-  Serial.print(F(" V, "));
-  Serial.print(nessoBattery.getChargeLevel());
-  Serial.println(F("%"));
+  if (batteryStatusReady) {
+    Serial.print(batteryVoltage, 2);
+    Serial.print(F(" V, "));
+    Serial.print(batteryChargeLevel);
+    Serial.print(F("%, "));
+    Serial.print(batteryDataState());
+    Serial.print(F(", age "));
+    Serial.print(static_cast<uint32_t>(millis() - lastBatterySuccessAt));
+    Serial.println(F(" ms"));
+  } else {
+    Serial.println(F("unavailable"));
+  }
   Serial.print(F("Packets:     TX "));
   Serial.print(static_cast<unsigned long>(totalPacketsSent));
   Serial.print(F(", RX "));
@@ -2001,12 +2260,17 @@ void printStatus() {
 }
 
 void runChannelActivityDetection() {
+  if (!operationAllowed(UserOperation::SCAN)) {
+    setUiNotice("Radio operation unavailable");
+    return;
+  }
   if (!radioReady || radioMode != RadioMode::LORA) {
     Serial.println(F("[LoRa] CAD requires a ready radio in LoRa mode"));
     setUiNotice("CAD requires LoRa");
     return;
   }
 
+  RadioOperationScope operation;
   int state = radio.standby();
   if (state != RADIOLIB_ERR_NONE) {
     printRadioError("standby before CAD", state);
@@ -2014,11 +2278,11 @@ void runChannelActivityDetection() {
     return;
   }
 
-  const int scanState = radio.scanChannel();
+  const int scanState = scanChannelResponsive();
   if (scanState == RADIOLIB_CHANNEL_FREE) {
     Serial.println(F("[LoRa] CAD: channel free"));
     setUiNotice("CAD: channel free");
-  } else if (scanState == RADIOLIB_PREAMBLE_DETECTED) {
+  } else if (scanState == RADIOLIB_LORA_DETECTED) {
     Serial.println(F("[LoRa] CAD: LoRa preamble detected"));
     setUiNotice("CAD: preamble found");
   } else {
@@ -2183,61 +2447,122 @@ void printRadioDiagnostics() {
 }
 
 void runChannelSurvey(float startMHz, float endMHz, float stepKHz, uint8_t samples) {
-  if (!radioReady || radioMode != RadioMode::LORA || startMHz < 150.0f || endMHz > 960.0f || endMHz < startMHz || stepKHz <= 0.0f || samples == 0) {
+  if (!operationAllowed(UserOperation::SURVEY)) {
+    Serial.println(F("[Survey] another operation is active"));
+    return;
+  }
+  if (!radioReady || radioMode != RadioMode::LORA || !isfinite(startMHz) || !isfinite(endMHz) || !isfinite(stepKHz) || startMHz < 150.0f || endMHz > 960.0f || endMHz < startMHz || stepKHz <= 0.0f || samples == 0) {
     Serial.println(F("[Survey] invalid range, samples, or radio mode"));
     return;
   }
 
-  const uint32_t channelCount = static_cast<uint32_t>(((endMHz - startMHz) * 1000.0f) / stepKHz) + 1UL;
-  if (channelCount > 200) {
+  const double channelCount = floor((static_cast<double>(endMHz) - startMHz) * 1000.0 / stepKHz + 0.001) + 1.0;
+  if (channelCount > 200.0) {
     Serial.println(F("[Survey] limit the scan to 200 channels"));
     return;
   }
 
+  channelSurvey = ChannelSurveyState();
+  channelSurvey.startMHz = startMHz;
+  channelSurvey.stepKHz = stepKHz;
+  channelSurvey.channelCount = static_cast<uint16_t>(channelCount);
+  channelSurvey.samples = samples;
+  channelSurveyActive = true;
   Serial.println(F("frequency_mhz,average_rssi_dbm,lora_detections,samples"));
-  for (uint32_t channel = 0; channel < channelCount; ++channel) {
-    const float frequencyMHz = startMHz + channel * stepKHz / 1000.0f;
-    int state = radio.standby();
+  setUiNotice("Survey running");
+}
+
+void finishChannelSurvey(const char* reason) {
+  if (!channelSurveyActive) {
+    return;
+  }
+  RadioOperationScope operation;
+  int state = radio.standby();
+  if (state == RADIOLIB_ERR_NONE) {
+    state = radio.setFrequency(activeLoRaProfile().frequencyMHz);
+  }
+  if (state == RADIOLIB_ERR_NONE) {
+    state = startConfiguredReceive();
+  }
+  channelSurveyActive = false;
+  packetReceivedFlag = false;
+  if (state != RADIOLIB_ERR_NONE) {
+    radioReady = false;
+    printRadioError("restore after survey", state);
+  }
+  Serial.print(F("[Survey] "));
+  Serial.println(reason);
+  setUiNotice(String("Survey ") + reason);
+}
+
+void runChannelSurveyTask() {
+  if (!channelSurveyActive) {
+    return;
+  }
+
+  const float frequencyMHz = channelSurvey.startMHz + channelSurvey.channelIndex * channelSurvey.stepKHz / 1000.0f;
+  int state = RADIOLIB_ERR_NONE;
+  if (channelSurvey.phase == SurveyPhase::TUNE) {
+    state = radio.standby();
     if (state == RADIOLIB_ERR_NONE) {
       state = radio.setFrequency(frequencyMHz);
     }
-    if (state != RADIOLIB_ERR_NONE) {
-      printRadioError("survey setFrequency", state);
-      break;
-    }
-
-    float totalRssi = 0.0f;
-    uint8_t detections = 0;
-    for (uint8_t sample = 0; sample < samples; ++sample) {
+    if (state == RADIOLIB_ERR_NONE) {
       state = radio.startReceive();
-      if (state != RADIOLIB_ERR_NONE) {
-        printRadioError("survey receive", state);
-        break;
-      }
-      delay(10);
-      totalRssi += radio.getRSSI(false);
-      radio.standby();
-      const int scanState = radio.scanChannel();
-      if (scanState == RADIOLIB_PREAMBLE_DETECTED) {
-        ++detections;
-      } else if (scanState != RADIOLIB_CHANNEL_FREE) {
-        printRadioError("survey CAD", scanState);
-      }
     }
-
-    Serial.print(frequencyMHz, 3);
-    Serial.print(',');
-    Serial.print(totalRssi / samples, 1);
-    Serial.print(',');
-    Serial.print(detections);
-    Serial.print(',');
-    Serial.println(samples);
+    if (state == RADIOLIB_ERR_NONE) {
+      channelSurvey.nextActionAt = millis() + 10UL;
+      channelSurvey.phase = SurveyPhase::SAMPLE_RSSI;
+    }
+  } else if (channelSurvey.phase == SurveyPhase::SAMPLE_RSSI) {
+    if (!timeReached(millis(), channelSurvey.nextActionAt)) {
+      return;
+    }
+    channelSurvey.totalRssi += radio.getRSSI(false);
+    state = radio.standby();
+    if (state == RADIOLIB_ERR_NONE) {
+      state = radio.startChannelScan();
+    }
+    if (state == RADIOLIB_ERR_NONE) {
+      channelSurvey.nextActionAt = millis() + channelScanTimeoutMs();
+      channelSurvey.phase = SurveyPhase::WAIT_CAD;
+    }
+  } else {
+    if ((radio.getIrqFlags() & RADIOLIB_SX126X_IRQ_CAD_DONE) == 0) {
+      if (timeReached(millis(), channelSurvey.nextActionAt)) {
+        finishChannelSurvey("CAD timeout");
+      }
+      return;
+    }
+    const int scanState = radio.getChannelScanResult();
+    if (scanState == RADIOLIB_LORA_DETECTED) {
+      ++channelSurvey.detections;
+    } else if (scanState != RADIOLIB_CHANNEL_FREE) {
+      printRadioError("survey CAD", scanState);
+      finishChannelSurvey("failed");
+      return;
+    }
+    if (++channelSurvey.sampleIndex == channelSurvey.samples) {
+      Serial.print(frequencyMHz, 3);
+      Serial.print(',');
+      Serial.print(channelSurvey.totalRssi / channelSurvey.samples, 1);
+      Serial.print(',');
+      Serial.print(channelSurvey.detections);
+      Serial.print(',');
+      Serial.println(channelSurvey.samples);
+      if (++channelSurvey.channelIndex == channelSurvey.channelCount) {
+        finishChannelSurvey("complete");
+        return;
+      }
+      channelSurvey.sampleIndex = 0;
+      channelSurvey.totalRssi = 0.0f;
+      channelSurvey.detections = 0;
+    }
+    channelSurvey.phase = SurveyPhase::TUNE;
   }
-
-  radio.setFrequency(activeLoRaProfile().frequencyMHz);
-  const int receiveState = startConfiguredReceive();
-  if (receiveState != RADIOLIB_ERR_NONE) {
-    printRadioError("restart receive after survey", receiveState);
+  if (state != RADIOLIB_ERR_NONE) {
+    printRadioError("survey sample", state);
+    finishChannelSurvey("failed");
   }
 }
 
@@ -2391,7 +2716,7 @@ void startBenchmark(uint16_t packetCount, size_t payloadLength, bool startedBySw
     Serial.println(F("Usage: benchmark <1-1000 packets> [24-120 bytes]"));
     return;
   }
-  if ((!startedBySweep && profileSweep.active) || outgoingTransfer.active || pendingRadioConfiguration.active) {
+  if (!operationAllowed(UserOperation::BENCHMARK, startedBySweep)) {
     Serial.println(F("[Benchmark] another long-running exercise is active"));
     return;
   }
@@ -2456,9 +2781,10 @@ void runBenchmarkTask() {
   }
 }
 
-void scheduleRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t delayMs, bool persist = true) {
-  if (profileIndex >= LORA_PROFILE_COUNT) {
-    return;
+bool scheduleRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t delayMs, bool persist = true, bool startedBySweep = false) {
+  if (profileIndex >= LORA_PROFILE_COUNT || !operationAllowed(UserOperation::CONFIGURE, startedBySweep)) {
+    Serial.println(F("[Radio] configuration change unavailable during another operation"));
+    return false;
   }
   pendingRadioConfiguration.active = true;
   pendingRadioConfiguration.mode = mode;
@@ -2473,10 +2799,11 @@ void scheduleRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t d
   Serial.print(delayMs);
   Serial.println(F(" ms"));
   redrawDisplay();
+  return true;
 }
 
-bool requestRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t delayMs = 3000, bool persist = true) {
-  if (profileIndex >= LORA_PROFILE_COUNT) {
+bool requestRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t delayMs = 3000, bool persist = true, bool startedBySweep = false) {
+  if (profileIndex >= LORA_PROFILE_COUNT || !operationAllowed(UserOperation::CONFIGURE, startedBySweep)) {
     return false;
   }
 
@@ -2489,8 +2816,7 @@ bool requestRadioConfiguration(RadioMode mode, uint8_t profileIndex, uint32_t de
   if (!sendPacket('M', targetPeerOrBroadcast(), body, txSequence++)) {
     return false;
   }
-  scheduleRadioConfiguration(mode, profileIndex, delayMs, persist);
-  return true;
+  return scheduleRadioConfiguration(mode, profileIndex, delayMs, persist, startedBySweep);
 }
 
 void runPendingRadioConfigurationTask() {
@@ -2506,6 +2832,10 @@ void runPendingRadioConfigurationTask() {
 }
 
 void scheduleSlottedAccess(uint32_t delayMs) {
+  if (!operationAllowed(UserOperation::CONFIGURE)) {
+    Serial.println(F("[Slots] configuration change unavailable during another operation"));
+    return;
+  }
   slotEpochAt = millis() + delayMs;
   slottedAccessEnabled = true;
   Serial.print(F("[Slots] synchronized epoch in "));
@@ -2514,6 +2844,9 @@ void scheduleSlottedAccess(uint32_t delayMs) {
 }
 
 void synchronizeSlottedAccess() {
+  if (!operationAllowed(UserOperation::CONFIGURE)) {
+    return;
+  }
   slottedAccessEnabled = false;
   constexpr uint32_t delayMs = 3000;
   if (sendPacket('Q', "*", String(delayMs), txSequence++)) {
@@ -2526,8 +2859,8 @@ void startProfileSweep(uint16_t packetCount, size_t payloadLength) {
     Serial.println(F("Usage: sweep <1-1000 packets> [24-120 bytes]"));
     return;
   }
-  if (benchmark.active || pendingRadioConfiguration.active) {
-    Serial.println(F("[Sweep] wait for the active benchmark or radio change"));
+  if (!operationAllowed(UserOperation::SWEEP)) {
+    Serial.println(F("[Sweep] another operation is active"));
     return;
   }
 
@@ -2536,7 +2869,7 @@ void startProfileSweep(uint16_t packetCount, size_t payloadLength) {
   profileSweep.profileIndex = 0;
   profileSweep.packetCount = packetCount;
   profileSweep.payloadLength = payloadLength;
-  if (!requestRadioConfiguration(RadioMode::LORA, profileSweep.profileIndex, 3000, false)) {
+  if (!requestRadioConfiguration(RadioMode::LORA, profileSweep.profileIndex, 3000, false, true)) {
     profileSweep = ProfileSweepState();
     return;
   }
@@ -2562,7 +2895,7 @@ void runProfileSweepTask() {
     if (!timeReached(millis(), profileSweep.nextActionAt)) {
       return;
     }
-    if (!requestRadioConfiguration(RadioMode::LORA, profileSweep.profileIndex, 3000, false)) {
+    if (!requestRadioConfiguration(RadioMode::LORA, profileSweep.profileIndex, 3000, false, true)) {
       profileSweep.nextActionAt = millis() + TX_MIN_INTERVAL_MS;
       return;
     }
@@ -2661,11 +2994,7 @@ void startTransfer(const String& data) {
     Serial.println(F(" bytes"));
     return;
   }
-  if (outgoingTransfer.active) {
-    Serial.println(F("[Transfer] another outgoing transfer is active"));
-    return;
-  }
-  if (benchmark.active || profileSweep.active || pendingRadioConfiguration.active) {
+  if (!operationAllowed(UserOperation::TRANSFER)) {
     Serial.println(F("[Transfer] another long-running exercise is active"));
     return;
   }
@@ -2763,6 +3092,10 @@ void handleIncomingFragment(const ReceivedPacket& packet) {
     return;
   }
   if (!incomingTransfer.active || currentTransferComplete || currentTransferExpired || incomingTransfer.id != transferId || incomingTransfer.source != packet.source) {
+    if (!operationAllowed(UserOperation::TRANSFER)) {
+      Serial.println(F("[Transfer] cannot start reception during another operation"));
+      return;
+    }
     incomingTransfer = IncomingTransfer();
     incomingTransfer.active = true;
     incomingTransfer.id = transferId;
@@ -2778,9 +3111,9 @@ void handleIncomingFragment(const ReceivedPacket& packet) {
   incomingTransfer.fragments[fragmentIndex] = fields;
   incomingTransfer.receivedMask |= static_cast<uint16_t>(1U << fragmentIndex);
   incomingTransfer.lastUpdateAt = millis();
-  sendTransferAcknowledgement(incomingTransfer);
 
   if (incomingTransfer.receivedMask != completeFragmentMask(incomingTransfer.fragmentCount)) {
+    sendTransferAcknowledgement(incomingTransfer);
     return;
   }
 
@@ -2792,9 +3125,11 @@ void handleIncomingFragment(const ReceivedPacket& packet) {
   if (crc16(reassembled) != incomingTransfer.checksum) {
     Serial.println(F("[Transfer] checksum mismatch; waiting for retransmission"));
     incomingTransfer.receivedMask = 0;
+    sendTransferAcknowledgement(incomingTransfer);
     return;
   }
 
+  sendTransferAcknowledgement(incomingTransfer);
   lastReceivedText = clipped(reassembled, MAX_BODY_LENGTH);
   Serial.print(F("[Transfer] complete from "));
   Serial.print(packet.source);
@@ -2812,9 +3147,14 @@ void handleTransferAcknowledgement(const ReceivedPacket& packet) {
   if (!outgoingTransfer.active || transferId != outgoingTransfer.id || (outgoingTransfer.destination != "*" && outgoingTransfer.destination != packet.source)) {
     return;
   }
+  if (outgoingTransfer.haveAcknowledgementSequence && static_cast<int32_t>(packet.sequence - outgoingTransfer.lastAcknowledgementSequence) <= 0) {
+    return;
+  }
 
   outgoingTransfer.destination = packet.source;
-  outgoingTransfer.acknowledgedMask |= receivedMask & completeFragmentMask(outgoingTransfer.fragmentCount);
+  outgoingTransfer.lastAcknowledgementSequence = packet.sequence;
+  outgoingTransfer.haveAcknowledgementSequence = true;
+  outgoingTransfer.acknowledgedMask = receivedMask & completeFragmentMask(outgoingTransfer.fragmentCount);
   outgoingTransfer.nextFragmentIndex = 0;
   outgoingTransfer.waitingForAcknowledgement = false;
   outgoingTransfer.lastSendAt = millis();
@@ -2839,6 +3179,10 @@ void rememberRelayMessage(const String& origin, uint32_t messageId) {
 }
 
 void sendRelayedText(const String& finalDestination, uint8_t hops, const String& text) {
+  if (!operationAllowed(UserOperation::TRANSMIT)) {
+    Serial.println(F("[Relay] another operation is active"));
+    return;
+  }
   if (finalDestination.length() == 0 || hops == 0 || hops > 8 || text.length() == 0) {
     Serial.println(F("Usage: relay send <node-id|*> <1-8 hops> <text>"));
     return;
@@ -3059,16 +3403,18 @@ void handleReceivedPacket(const String& raw, float rssi, float snr) {
 }
 
 void pollRadio() {
-  if (!radioReady || !packetReceivedFlag) {
+  if (!radioReady || radioOperationBusy || channelSurveyActive || !packetReceivedFlag) {
     return;
   }
 
   packetReceivedFlag = false;
+  if ((radio.getIrqFlags() & RADIOLIB_SX126X_IRQ_RX_DONE) == 0) {
+    return;
+  }
   String raw;
   const int state = radio.readData(raw);
 
   if (state == RADIOLIB_ERR_NONE) {
-    raw.trim();
     const float rssi = radio.getRSSI();
     const float snr = radioMode == RadioMode::LORA ? radio.getSNR() : 0.0f;
     ++totalPacketsReceived;
@@ -3123,6 +3469,14 @@ void handleCommand(String command) {
     return;
   }
 
+  String arguments = command;
+  const String verb = takeToken(arguments);
+  const bool changesRadio = command == "config defaults" || verb == "profile" || verb == "mode" || verb == "crc" || verb == "iq" || verb == "header" || verb == "ldro" || verb == "whitening" || verb == "rxgain" || verb == "lowpower" || verb == "duty" || verb == "slots" || command.startsWith("cad auto ") || verb == "relay" || command == "diag calibrate" || command == "diag clear";
+  if (changesRadio && !operationAllowed(UserOperation::CONFIGURE)) {
+    Serial.println(F("[Radio] stop the active operation before changing settings"));
+    return;
+  }
+
   if (command == "?" || command == "help") {
     Serial.println(F("Commands:"));
     Serial.println(F("  t <text>  send text"));
@@ -3140,6 +3494,7 @@ void handleCommand(String command) {
     Serial.println(F("  rxgain power|boosted | lowpower on|off"));
     Serial.println(F("  cad auto on|off | duty off|<percent> | slots on|off|sync"));
     Serial.println(F("  survey [startMHz endMHz stepKHz samples]"));
+    Serial.println(F("  survey stop"));
     Serial.println(F("  diag | diag clear | diag calibrate"));
     Serial.println(F("  sleep <seconds>"));
     Serial.println(F("  peers | peer auto|<node-id>"));
@@ -3357,6 +3712,8 @@ void handleCommand(String command) {
     } else {
       Serial.println(F("Usage: slots on|off|sync"));
     }
+  } else if (command == "survey stop") {
+    finishChannelSurvey("stopped");
   } else if (command == "survey") {
     const float center = activeLoRaProfile().frequencyMHz;
     runChannelSurvey(center - 0.2f, center + 0.2f, 100.0f, 3);
@@ -3424,9 +3781,12 @@ void handleCommand(String command) {
   } else if (command == "transfer resume") {
     if (outgoingTransfer.active || outgoingTransfer.data.length() == 0) {
       Serial.println(F("[Transfer] no paused outgoing transfer"));
+    } else if (!operationAllowed(UserOperation::TRANSFER)) {
+      Serial.println(F("[Transfer] another operation is active"));
     } else {
       outgoingTransfer.active = true;
       outgoingTransfer.attempts = 1;
+      outgoingTransfer.haveAcknowledgementSequence = false;
       outgoingTransfer.nextFragmentIndex = 0;
       outgoingTransfer.waitingForAcknowledgement = false;
       outgoingTransfer.lastSendAt = 0;
@@ -3454,7 +3814,7 @@ void pollRemoteCommandApi() {
   if (remoteHttpReady) {
     remoteApiServer.handleClient();
   }
-  if (remoteCommandQueue == nullptr) {
+  if (remoteCommandQueue == nullptr || radioOperationBusy) {
     return;
   }
 
@@ -3479,11 +3839,19 @@ void pollRemoteCommandApi() {
 }
 
 void pollSerial() {
-  while (Serial.available() > 0) {
+  for (uint8_t consumed = 0; consumed < 64 && Serial.available() > 0; ++consumed) {
     const char character = static_cast<char>(Serial.read());
     if (character == '\n' || character == '\r') {
-      handleCommand(serialLine);
+      const String command = serialLine;
       serialLine = "";
+      if (radioOperationBusy) {
+        const RemoteEnqueueResult result = enqueueRemoteCommand(command, "Serial");
+        if (result == RemoteEnqueueResult::FULL) {
+          Serial.println(F("[Serial] command queue full"));
+        }
+      } else {
+        handleCommand(command);
+      }
     } else if (serialLine.length() < MAX_TRANSFER_LENGTH + 80) {
       serialLine += character;
     }
@@ -3495,7 +3863,7 @@ bool uiPointInRect(int16_t x, int16_t y, int16_t left, int16_t top, int16_t widt
 }
 
 bool uiLongExerciseActive() {
-  return benchmark.active || profileSweep.active || outgoingTransfer.active || pendingRadioConfiguration.active;
+  return !operationAllowed(UserOperation::CONFIGURE);
 }
 
 void requestUiRadioChange(RadioMode mode, uint8_t profileIndex) {
@@ -3520,7 +3888,9 @@ void applyUiRadioChange() {
 }
 
 void stopUiTest() {
-  if (profileSweep.active) {
+  if (channelSurveyActive) {
+    finishChannelSurvey("stopped");
+  } else if (profileSweep.active) {
     stopProfileSweep("stopped from touchscreen");
   } else if (benchmark.active) {
     printBenchmarkReport("stopped");
@@ -3585,7 +3955,7 @@ void handleUiTestTouch(int16_t x, int16_t y) {
         setUiNotice(profileSweep.active ? "Profile sweep started" : "Sweep unavailable");
       }
     } else if (x >= 122 && x < 237) {
-      if (benchmark.active || profileSweep.active) {
+      if (benchmark.active || profileSweep.active || channelSurveyActive) {
         stopUiTest();
       } else {
         uiPage = UiPage::RESULTS;
@@ -3596,6 +3966,10 @@ void handleUiTestTouch(int16_t x, int16_t y) {
 }
 
 void handleUiAccessTouch(int16_t x, int16_t y) {
+  if (!operationAllowed(UserOperation::CONFIGURE)) {
+    setUiNotice("Stop active operation first");
+    return;
+  }
   if (!((y >= 23 && y < 58) || (y >= 62 && y < 97))) {
     return;
   }
@@ -3710,6 +4084,10 @@ void handleUiPeersTouch(int16_t x, int16_t y) {
 }
 
 void handleUiTouch(int16_t x, int16_t y) {
+  if (radioOperationBusy && (uiConfirmationActive || y < UI_NAV_Y)) {
+    setUiNotice("Radio busy");
+    return;
+  }
   if (uiConfirmationActive) {
     if (uiPointInRect(x, y, 18, 72, 96, 26)) {
       applyUiRadioChange();
@@ -3748,22 +4126,40 @@ void handleUiTouch(int16_t x, int16_t y) {
 }
 
 void pollTouch() {
-  if (!touchReady || static_cast<uint32_t>(millis() - lastTouchPollAt) < 25UL) {
+  if (!touchReady || static_cast<uint32_t>(millis() - lastTouchPollAt) < INPUT_POLL_INTERVAL_MS) {
     return;
   }
   lastTouchPollAt = millis();
 
-  int16_t x = 0;
-  int16_t y = 0;
-  const bool pressed = nessoTouch.read(x, y);
-  if (pressed && !previousTouchPressed && x >= 0 && x < UI_WIDTH && y >= 0 && y < 135) {
-    handleUiTouch(x, y);
-  }
+  int16_t rawX = 0;
+  int16_t rawY = 0;
+  const bool pressed = nessoTouch.read(rawX, rawY);
+  const int16_t x = rawY;
+  const int16_t y = UI_HEIGHT - 1 - rawX;
+  const bool wasPressed = previousTouchPressed;
   previousTouchPressed = pressed;
+  if (pressed) {
+    if (!wasPressed) {
+      touchPressedAt = millis();
+      touchHandled = false;
+    } else if (!touchHandled && static_cast<uint32_t>(millis() - touchPressedAt) >= TOUCH_SETTLE_MS && x >= 0 && x < UI_WIDTH && y >= 0 && y < UI_HEIGHT) {
+      touchHandled = true;
+      Serial.printf("[Input] touch x=%d y=%d\r\n", x, y);
+      handleUiTouch(x, y);
+    }
+  } else {
+    touchPressedAt = 0;
+    touchHandled = false;
+  }
 }
 
 void runUiRefreshTask() {
+  const bool batteryUpdated = updateBatteryStatus();
   if (!displayReady) {
+    return;
+  }
+  if (batteryUpdated) {
+    redrawDisplay();
     return;
   }
   if (uiNotice.length() && timeReached(millis(), uiNoticeUntil)) {
@@ -3772,15 +4168,65 @@ void runUiRefreshTask() {
     return;
   }
 
-  const uint32_t refreshInterval = benchmark.active || profileSweep.active || pendingRadioConfiguration.active ? 1000UL : 15000UL;
+  const uint32_t refreshInterval = benchmark.active || profileSweep.active || pendingRadioConfiguration.active || channelSurveyActive ? 1000UL : 15000UL;
   if (static_cast<uint32_t>(millis() - lastUiRefreshAt) >= refreshInterval) {
     redrawDisplay();
   }
 }
 
+void powerOffNesso() {
+  Serial.println(F("[Power] shutting down"));
+  if (displayReady) {
+    nessoDisplay.fillScreen(COLOR_BLACK);
+    drawUiText("POWERING OFF", UI_WIDTH / 2, 58, COLOR_WHITE, MC_DATUM, 2);
+    delay(500);
+    digitalWrite(LCD_BACKLIGHT, LOW);
+  }
+
+  if (remoteHttpReady) {
+    remoteApiServer.stop();
+    remoteHttpReady = false;
+  }
+  WiFi.mode(WIFI_OFF);
+  if (remoteBleReady) {
+    BLEDevice::deinit(false);
+    remoteBleReady = false;
+  }
+  if (radioReady) {
+    radio.clearPacketReceivedAction();
+    radio.sleep(false);
+    radioReady = false;
+  }
+  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(LORA_LNA_ENABLE, LOW);
+  digitalWrite(LORA_ANTENNA_SWITCH, LOW);
+  digitalWrite(LORA_ENABLE, LOW);
+  digitalWrite(POWEROFF, LOW);
+  pinMode(POWEROFF, OUTPUT);
+  for (uint8_t step = 0; step < POWER_OFF_PULSE_STEPS; ++step) {
+    digitalWrite(POWEROFF, (step & 1U) ? HIGH : LOW);
+    delay(POWER_OFF_PULSE_MS);
+  }
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  esp_deep_sleep_start();
+}
+
 void pollButtons() {
-  const bool key1Pressed = digitalRead(KEY1) == LOW;
   const uint32_t now = millis();
+  if (static_cast<uint32_t>(now - lastButtonPollAt) < INPUT_POLL_INTERVAL_MS) {
+    return;
+  }
+  lastButtonPollAt = now;
+
+  const bool key1Pressed = digitalRead(KEY1) == LOW;
+  const bool key2Pressed = digitalRead(KEY2) == LOW;
+
+  if (key1Pressed != previousKey1Pressed) {
+    Serial.printf("[Input] KEY1 %s\r\n", key1Pressed ? "pressed" : "released");
+  }
+  if (key2Pressed != previousKey2Pressed) {
+    Serial.printf("[Input] KEY2 %s\r\n", key2Pressed ? "pressed" : "released");
+  }
 
   if (now - lastButtonEvent >= 250) {
     if (key1Pressed && !previousKey1Pressed) {
@@ -3796,7 +4242,22 @@ void pollButtons() {
     }
   }
 
+  if (!key2Pressed) {
+    key2PowerOffArmed = true;
+    if (previousKey2Pressed && key2PressedAt != 0) {
+      setUiNotice("Power off cancelled");
+    }
+    key2PressedAt = 0;
+  } else if (key2PowerOffArmed && !previousKey2Pressed) {
+    key2PressedAt = now;
+    setUiNotice("Hold KEY2 3 s to power off", POWER_OFF_HOLD_MS);
+  } else if (key2PowerOffArmed && key2PressedAt != 0 && static_cast<uint32_t>(now - key2PressedAt) >= POWER_OFF_HOLD_MS) {
+    key2PowerOffArmed = false;
+    powerOffNesso();
+  }
+
   previousKey1Pressed = key1Pressed;
+  previousKey2Pressed = key2Pressed;
 }
 
 void runPeriodicTasks() {
@@ -3820,6 +4281,7 @@ void runPeriodicTasks() {
 void setup() {
   Serial.begin(115200);
   Serial.setTimeout(20);
+  Serial.setTxTimeoutMs(2);
 
   const uint32_t serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 2000) {
@@ -3856,6 +4318,7 @@ void loop() {
   pollRemoteCommandApi();
   pollButtons();
   pollTouch();
+  runChannelSurveyTask();
   runDeferredPacketTask();
   retryPendingText();
   runBenchmarkTask();
