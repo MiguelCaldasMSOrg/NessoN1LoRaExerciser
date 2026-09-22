@@ -115,6 +115,8 @@ constexpr int LORA_LNA_ENABLE = 102;
 constexpr int LORA_ANTENNA_SWITCH = 103;
 constexpr int LORA_ENABLE = 104;
 constexpr int POWEROFF = 105;
+constexpr int KEY1 = 106;
+constexpr int KEY2 = 107;
 constexpr int HEX = 16;
 uint32_t testNow = 1000;
 uint32_t millis() { return testNow; }
@@ -128,6 +130,10 @@ struct NessoBattery {
   static constexpr uint8_t BQ27220_VOLTAGE = 0x08;
   static constexpr uint8_t AW3200_SYS_STATUS = 0x08;
   enum ChargeStatus { NOT_CHARGING, PRE_CHARGE, CHARGING, FULL_CHARGE };
+  bool began = false;
+  bool chargeEnabled = false;
+  void begin() { began = true; }
+  void enableCharge() { chargeEnabled = true; }
 };
 '''
 
@@ -138,12 +144,17 @@ bool channelSurveyActive = false;
 bool pendingTextActive = false;
 bool touchReady = true;
 bool displayReady = true;
+bool visualsEnabled = true;
+bool transmittingActive = false;
 bool remoteHttpReady = true;
 bool remoteBleReady = true;
 bool previousTouchPressed = false;
 bool touchHandled = false;
 uint32_t touchPressedAt = 0;
 uint32_t lastTouchPollAt = 0;
+uint32_t lastButtonPollAt = 0;
+uint32_t lastPhysicalActivityAt = 0;
+uint32_t visualTimeoutSeconds = DEFAULT_VISUAL_TIMEOUT_SECONDS;
 bool packetReceivedFlag = false;
 bool listenBeforeTalkEnabled = false;
 bool dutyCycleLimitEnabled = false;
@@ -180,13 +191,16 @@ uint32_t lastBatterySuccessAt = 0;
 bool batteryStatusReady = false;
 bool batteryReadSucceeded = false;
 bool batteryChargeStatusReady = false;
+NessoBattery nessoBattery;
 bool gaugeOk = true;
 bool chargerOk = true;
 uint16_t gaugeVoltage = 4120;
 uint16_t gaugePercent = 12;
 unsigned gaugeReads = 0;
 unsigned buttonPolls = 0;
+unsigned pingsSent = 0;
 unsigned screenPolls = 0;
+unsigned screenDraws = 0;
 unsigned httpPolls = 0;
 bool reenterTouchHandler = false;
 std::vector<std::pair<int16_t, int16_t>> touches;
@@ -194,6 +208,15 @@ std::vector<uint16_t> acknowledgements;
 std::vector<String> queuedCommands;
 std::vector<String> executedCommands;
 String receivedPayload;
+bool key1Pressed = false;
+bool key2Pressed = false;
+uint32_t lastButtonEvent = 0;
+uint32_t key2PressedAt = 0;
+bool previousKey1Pressed = false;
+bool previousKey2Pressed = false;
+bool key2PowerOffArmed = false;
+UiPage uiPage = UiPage::HOME;
+bool uiConfirmationActive = false;
 
 struct PowerPinWrite { int pin; int level; uint32_t at; };
 std::vector<PowerPinWrite> powerPinWrites;
@@ -219,7 +242,7 @@ void esp_deep_sleep_start() {
 struct WifiMock { bool stopped = false; void mode(int requested) { assert(requested == WIFI_OFF); stopped = true; } } WiFi;
 struct HttpMock { bool stopped = false; void stop() { stopped = true; } } remoteApiServer;
 struct BLEDevice { inline static bool stopped = false; static void deinit(bool) { stopped = true; } };
-struct DisplayMock { void fillScreen(uint16_t) {} } nessoDisplay;
+struct DisplayMock { unsigned fills = 0; void fillScreen(uint16_t) { ++fills; } } nessoDisplay;
 void drawUiText(const String&, int16_t, int16_t, uint16_t, int, uint8_t) {}
 
 struct TouchMock {
@@ -275,13 +298,18 @@ struct RadioMock {
   float getSNR() { return 7.0f; }
 } radio;
 
-int digitalRead(int) { return radio.getIrqFlags() != 0 ? HIGH : 0; }
+int digitalRead(int pin) {
+  if (pin == KEY1) { ++buttonPolls; return key1Pressed ? LOW : HIGH; }
+  if (pin == KEY2) { return key2Pressed ? LOW : HIGH; }
+  return radio.getIrqFlags() != 0 ? HIGH : LOW;
+}
 const LoRaProfile& activeLoRaProfile() { return LORA_PROFILES[activeProfileIndex]; }
 void printRadioError(const char*, int) {}
-void redrawDisplay() {}
-void setUiNotice(const String&) {}
-void setTransmitting(bool) {}
+void redrawDisplay() { ++screenDraws; }
+void setUiNotice(const String&, uint32_t = 3000) {}
 int startConfiguredReceive() { return radio.startReceive(); }
+bool sendPing() { ++pingsSent; return true; }
+void applyUiRadioChange() {}
 String targetPeerOrBroadcast() { return "87654321"; }
 void pollTouch();
 void handleUiTouch(int16_t horizontal, int16_t vertical) {
@@ -293,7 +321,6 @@ void handleUiTouch(int16_t horizontal, int16_t vertical) {
   }
 }
 void handleReceivedPacket(const String& raw, float, float) { receivedPayload = raw; }
-void pollButtons() { ++buttonPolls; }
 void runUiRefreshTask() { ++screenPolls; }
 void pollRemoteCommandApi() { ++httpPolls; }
 bool readI2cWord(uint8_t, uint8_t address, uint16_t& value) {
@@ -330,18 +357,25 @@ void resetState() {
   incomingTransfer = IncomingTransfer(); outgoingTransfer = OutgoingTransfer();
   channelSurvey = ChannelSurveyState(); radio = RadioMock();
   previousTouchPressed = touchHandled = false; touchPressedAt = lastTouchPollAt = 0;
+  lastButtonPollAt = lastButtonEvent = key2PressedAt = 0;
+  previousKey1Pressed = previousKey2Pressed = key2PowerOffArmed = false;
+  key1Pressed = key2Pressed = false; uiPage = UiPage::HOME; uiConfirmationActive = false;
+  visualsEnabled = true; transmittingActive = false;
+  lastPhysicalActivityAt = millis(); visualTimeoutSeconds = DEFAULT_VISUAL_TIMEOUT_SECONDS;
   nessoTouch = TouchMock(); touches.clear(); acknowledgements.clear();
   queuedCommands.clear(); executedCommands.clear(); Serial.input.clear(); serialLine = "";
   receivedPayload = ""; packetReceivedFlag = false;
   lastTxAt = 0; implicitPacketLength = 0;
   listenBeforeTalkEnabled = dutyCycleLimitEnabled = slottedAccessEnabled = false;
   totalPacketsSent = totalPacketsReceived = totalTransmitAirtimeUs = 0;
-  buttonPolls = screenPolls = httpPolls = 0;
+  buttonPolls = pingsSent = screenPolls = screenDraws = httpPolls = 0;
   reenterTouchHandler = false;
   batteryStatusReady = batteryReadSucceeded = batteryChargeStatusReady = false;
+  batteryChargeStatus = NessoBattery::NOT_CHARGING; nessoBattery = NessoBattery();
   lastBatteryStatusAt = lastBatterySuccessAt = 0;
   gaugeOk = chargerOk = true; gaugeVoltage = 4120; gaugePercent = 12; gaugeReads = 0;
   displayReady = remoteHttpReady = remoteBleReady = true;
+  nessoDisplay = DisplayMock();
   powerPinWrites.clear(); powerOutputEnabled = allWakeSourcesDisabled = deepSleepEntered = false;
   WiFi.stopped = remoteApiServer.stopped = BLEDevice::stopped = false;
 }
@@ -372,6 +406,55 @@ void testTouch() {
   pollTouch(); delay(INPUT_POLL_INTERVAL_MS); reenterTouchHandler = true; pollTouch();
   assert(touches.size() == 1);
   puts("PASS touch rotation, bounds and one-action-per-contact");
+}
+
+int lastPinLevel(int pin) {
+  for (auto write = powerPinWrites.rbegin(); write != powerPinWrites.rend(); ++write) {
+    if (write->pin == pin) { return write->level; }
+  }
+  return -1;
+}
+
+void testVisualOutput() {
+  uint32_t parsedTimeout = 123;
+  assert(parseVisualTimeout("off", parsedTimeout) && parsedTimeout == 0);
+  assert(parseVisualTimeout(" 60 ", parsedTimeout) && parsedTimeout == 60);
+  assert(parseVisualTimeout("86400", parsedTimeout) && parsedTimeout == 86400);
+  assert(!parseVisualTimeout("0", parsedTimeout));
+  assert(!parseVisualTimeout("86401", parsedTimeout));
+  assert(!parseVisualTimeout("60s", parsedTimeout));
+
+  resetState(); visualTimeoutSeconds = 1; delay(999); runVisualTimeoutTask(); assert(visualsEnabled);
+  delay(1); runVisualTimeoutTask(); assert(!visualsEnabled);
+  assert(lastPinLevel(LCD_BACKLIGHT) == LOW && lastPinLevel(LED_BUILTIN) == LOW);
+
+  resetState(); visualTimeoutSeconds = 0; delay(60000); runVisualTimeoutTask(); assert(visualsEnabled);
+
+  resetState(); setTransmitting(true); assert(transmittingActive && lastPinLevel(LED_BUILTIN) == HIGH);
+  setVisualsEnabled(false); assert(lastPinLevel(LED_BUILTIN) == LOW);
+  setTransmitting(true); assert(lastPinLevel(LED_BUILTIN) == LOW);
+  assert(recordPhysicalActivity() && lastPinLevel(LCD_BACKLIGHT) == HIGH && lastPinLevel(LED_BUILTIN) == HIGH);
+  setTransmitting(false); assert(!transmittingActive && lastPinLevel(LED_BUILTIN) == LOW);
+
+  resetState(); testNow = UINT32_MAX - 500; lastPhysicalActivityAt = millis(); visualTimeoutSeconds = 1;
+  delay(1000); runVisualTimeoutTask(); assert(!visualsEnabled);
+
+  resetState(); setVisualsEnabled(false); powerPinWrites.clear();
+  nessoTouch.pressed = true; nessoTouch.rawX = 10; nessoTouch.rawY = 72;
+  pollTouch(); assert(visualsEnabled && touches.empty());
+  assert(lastPinLevel(LCD_BACKLIGHT) == HIGH);
+  delay(INPUT_POLL_INTERVAL_MS); pollTouch(); assert(touches.empty());
+
+  resetState(); pollButtons(); delay(INPUT_POLL_INTERVAL_MS); key2Pressed = true; pollButtons();
+  delay(100); key2Pressed = false; pollButtons(); assert(!visualsEnabled);
+
+  powerPinWrites.clear(); delay(INPUT_POLL_INTERVAL_MS); key2Pressed = true; pollButtons();
+  assert(visualsEnabled && key2PressedAt == 0);
+  delay(INPUT_POLL_INTERVAL_MS); key2Pressed = false; pollButtons(); assert(visualsEnabled);
+
+  resetState(); setVisualsEnabled(false); powerPinWrites.clear(); key1Pressed = true; pollButtons();
+  assert(visualsEnabled && pingsSent == 0);
+  puts("PASS visuals timeout, wake and indicator suppression");
 }
 
 void testIrqAndFraming() {
@@ -450,12 +533,18 @@ void testGuards() {
 }
 
 void testBattery() {
+  resetState(); setupBatteryCharging();
+  assert(nessoBattery.began && nessoBattery.chargeEnabled);
+  assert(std::string(batteryChargeStatusName()) == "unavailable");
+
   resetState(); assert(std::string(batteryDataState()) == "unavailable");
   assert(updateBatteryStatus(true) && batteryStatusFresh());
   assert(batteryChargeLevel == 12 && batteryVoltage > 4.11f);
+  assert(std::string(batteryChargeStatusName()) == "charging");
   const auto reads = gaugeReads; delay(1000); assert(!updateBatteryStatus()); assert(gaugeReads == reads);
   gaugeOk = false; delay(BATTERY_STATUS_INTERVAL_MS); assert(updateBatteryStatus());
   assert(std::string(batteryDataState()) == "stale" && batteryChargeLevel == 12);
+  assert(std::string(batteryChargeStatusName()) == "charging");
   gaugeOk = true; gaugePercent = 13; assert(updateBatteryStatus(true));
   assert(batteryStatusFresh() && batteryChargeLevel == 13);
   delay(BATTERY_STALE_AFTER_MS); assert(!batteryStatusFresh());
@@ -523,7 +612,7 @@ void testPowerOff() {
 }
 
 int main() {
-  testTouch(); testIrqAndFraming(); testTransfer(); testGuards(); testBattery(); testSurveyAndWaits(); testSerialReentry();
+  testTouch(); testVisualOutput(); testIrqAndFraming(); testTransfer(); testGuards(); testBattery(); testSurveyAndWaits(); testSerialReentry();
   testPowerOff();
   for (const auto& profile : LORA_PROFILES) {
     assert(profile.frequencyMHz == LORA_FREQUENCY_MHZ && profile.txPowerDbm <= LORA_TX_POWER_DBM);
@@ -543,11 +632,11 @@ def main():
         raise SystemExit("A host C++17 compiler (g++ or clang++) is required; set CXX if needed.")
 
     constants = "\n".join(re.findall(r"^constexpr (?:uint\d+_t|int\d+_t|size_t|float) [A-Z0-9_]+ = [^;]+;", SOURCE, re.MULTILINE))
-    type_names = ["RadioMode", "UserOperation", "RemoteEnqueueResult", "LoRaProfile", "BenchmarkState", "OutgoingTransfer", "IncomingTransfer", "PendingRadioConfiguration", "SweepPhase", "ProfileSweepState", "SurveyPhase", "ChannelSurveyState", "ReceivedPacket"]
+    type_names = ["RadioMode", "UserOperation", "RemoteEnqueueResult", "LoRaProfile", "BenchmarkState", "OutgoingTransfer", "IncomingTransfer", "PendingRadioConfiguration", "SweepPhase", "ProfileSweepState", "SurveyPhase", "ChannelSurveyState", "UiPage", "ReceivedPacket"]
     types = "\n".join(extract(r"^(?:struct|enum class) " + name + r"\b[^\n]*\{\n.*?^\};") for name in type_names)
     profiles = extract(r"^constexpr LoRaProfile LORA_PROFILES\[\] = \{\n.*?^\};")
     constants = "\n".join(line for line in constants.splitlines() if "LORA_PROFILE_COUNT" not in line)
-    names = ["timeReached", "completeFragmentMask", "crc16", "takeDelimitedToken", "clipped", "operationAllowed", "sendTransferAcknowledgement", "handleIncomingFragment", "handleTransferAcknowledgement", "pollTouch", "pollRadio", "batteryStatusFresh", "batteryDataState", "updateBatteryStatus", "waitForRadioEvent", "channelScanTimeoutMs", "scanChannelResponsive", "radioBackoff", "waitForTransmitAccess", "recordTransmitAirtime", "sendPacket", "runChannelSurvey", "finishChannelSurvey", "runChannelSurveyTask", "serviceRadioWait", "pollSerial", "powerOffNesso"]
+    names = ["timeReached", "completeFragmentMask", "crc16", "takeDelimitedToken", "clipped", "operationAllowed", "parseVisualTimeout", "sendTransferAcknowledgement", "handleIncomingFragment", "handleTransferAcknowledgement", "setVisualsEnabled", "recordPhysicalActivity", "runVisualTimeoutTask", "setTransmitting", "pollTouch", "pollButtons", "pollRadio", "batteryStatusFresh", "batteryDataState", "batteryChargeStatusName", "setupBatteryCharging", "updateBatteryStatus", "waitForRadioEvent", "channelScanTimeoutMs", "scanChannelResponsive", "radioBackoff", "waitForTransmitAccess", "recordTransmitAirtime", "sendPacket", "runChannelSurvey", "finishChannelSurvey", "runChannelSurveyTask", "serviceRadioWait", "pollSerial", "powerOffNesso"]
     definitions = []
     declarations = []
     for name in names:
@@ -559,6 +648,8 @@ def main():
         assert guard in function(name), f"Missing shared operation guard in {name}"
     assert "radio.scanChannel()" not in SOURCE
     assert "radio.transmit(" not in SOURCE
+    assert "visuals on|off|timeout <seconds|off>" in function("handleCommand")
+    assert "setupBatteryCharging();" in function("setup")
 
     program = "\n".join([PRELUDE, constants, types, profiles, GLOBALS, extract(r"^class RadioOperationScope \{\n.*?^\};"), *declarations, *definitions, TESTS])
     with tempfile.TemporaryDirectory(prefix="nesso-regression-") as directory:

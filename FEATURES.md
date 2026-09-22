@@ -254,14 +254,16 @@ Startup proceeds as follows:
 
 1. The serial connection starts at 115,200 bits per second and waits for a host for up to two seconds.
 2. The node identifier is derived from the ESP32-C6 electronic-fuse Media Access Control address.
-3. The versioned configuration blob is read and validated from Non-Volatile Storage; defaults remain active if it is absent or invalid.
-4. Board input/output, radio power, antenna controls, display, and shared bus are initialized.
-5. The SX1262 starts with the restored LoRa/GFSK and packet configuration and enters receive mode.
-6. The board attempts the configured Wi-Fi station for 12 seconds, then starts the fixed recovery access point if credentials are absent or association fails.
-7. The HTTP server and Bluetooth Low Energy service start.
-8. An immediate broadcast `HELLO` packet is sent if radio initialization succeeded.
-9. The first periodic `HELLO` is scheduled 25 to almost 30 seconds later.
-10. The first telemetry packet is scheduled 15 to almost 30 seconds later.
+3. The versioned configuration blob and separate visual inactivity timeout are read from Non-Volatile Storage; defaults remain active if either is absent or invalid.
+4. Board input/output, radio power, antenna controls, and the shared bus are initialized.
+5. The AW32001 charger is configured and enabled once using the vendor library defaults.
+6. The display and touch controller are initialized, then the battery gauge and charger status are sampled.
+7. The SX1262 starts with the restored LoRa/GFSK and packet configuration and enters receive mode.
+8. The board attempts the configured Wi-Fi station for 12 seconds, then starts the fixed recovery access point if credentials are absent or association fails.
+9. The HTTP server and Bluetooth Low Energy service start.
+10. An immediate broadcast `HELLO` packet is sent if radio initialization succeeded.
+11. The first periodic `HELLO` is scheduled 25 to almost 30 seconds later.
+12. The first telemetry packet is scheduled 15 to almost 30 seconds later.
 
 The timing offsets are deterministic values derived from the node identifier. They spread two boards' periodic traffic without requiring synchronized clocks. Later `HELLO` intervals are 25 to almost 30 seconds, and later telemetry intervals are 60 to almost 75 seconds.
 
@@ -275,18 +277,18 @@ The input buffer holds approximately 1,232 characters so that a maximum-length t
 
 ### Buttons
 
-Both user buttons are polled. The front button is edge-triggered with a 250-millisecond debounce interval, while the side button requires a continuous three-second hold to prevent accidental shutdown.
+Both user buttons are polled. The front button is edge-triggered with a 250-millisecond debounce interval. A short side-button press disables visual output, while a continuous three-second hold prevents accidental full shutdown.
 
 | Button | Action |
 | --- | --- |
 | Front `KEY1` | Ping while Home is visible, apply an on-screen radio confirmation, or return to Home from another page |
-| Side `KEY2` | Hold continuously for three seconds to power off the board; release early to cancel |
+| Side `KEY2` | Tap to disable visuals; hold continuously for three seconds to power off the board |
 
-The front-button ping obeys the same transmit-access controls as a serial `p` command. A completed side-button hold blanks the display, stops Wi-Fi and BLE, sleeps the radio, and disables the radio path. The Nesso's `POWEROFF` signal goes to a programmed power controller, not a simple level-controlled latch: shutdown sends five low/high pulses with 50 ms per level, following [M5Stack's Nesso implementation](https://github.com/m5stack/M5Unified/blob/master/src/utility/Power_Class.inl). Holding that signal continuously high can reset rather than power off the board. If power remains, the CPU enters deep sleep with all wake sources disabled. The separate hardware power button switches the board on again.
+The front-button ping obeys the same transmit-access controls as a serial `p` command. The first button or touch contact after visuals are disabled restores them and is consumed without invoking its normal action. No-visuals mode only blanks the LCD/backlight and suppresses the transmit indicator; CPU, radio, Wi-Fi, Bluetooth, timers, commands, and exercises remain active. A completed side-button hold stops those subsystems and disables the radio path. The Nesso's `POWEROFF` signal goes to a programmed power controller, not a simple level-controlled latch: shutdown sends five low/high pulses with 50 ms per level, following [M5Stack's Nesso implementation](https://github.com/m5stack/M5Unified/blob/master/src/utility/Power_Class.inl). Holding that signal continuously high can reset rather than power off the board. If power remains, the CPU enters deep sleep with all wake sources disabled. The separate hardware power button switches the board on again.
 
 ### Touchscreen
 
-The 240-by-135 landscape touchscreen is the primary disconnected interface. Raw portrait touch coordinates are swapped and inverted before landscape hit-testing. Every page header includes a tiny battery gauge and charge percentage. The cached native BQ27220 state-of-charge reading is refreshed once per minute; cyan indicates charging, yellow or red indicates low charge, and green indicates normal charge. Gray `--%` means no valid sample, and a gray percentage with `!` marks a last-good sample that is stale after a failed read or two minutes without a successful refresh. Serial status reports the sample age; HTTP status exposes freshness and uses `null` for stale numeric values. A persistent bottom navigation bar selects five pages:
+The 240-by-135 landscape touchscreen is the primary disconnected interface. Raw portrait touch coordinates are swapped and inverted before landscape hit-testing. Every page header includes a tiny battery gauge and charge percentage. The cached native BQ27220 state-of-charge reading and AW32001 charger state are refreshed once per minute; each I2C operation has a 20-millisecond timeout. Cyan indicates charging, yellow or red indicates low charge, and green indicates normal charge. Gray `--%` means no valid gauge sample, and a gray percentage with `!` marks a last-good sample that is stale after a failed read or two minutes without a successful refresh. Serial status reports gauge and charger state separately; HTTP status exposes freshness, independent charge state, and `null` for stale numeric values. A persistent bottom navigation bar selects five pages:
 
 | Page | Controls and information |
 | --- | --- |
@@ -296,7 +298,7 @@ The 240-by-135 landscape touchscreen is the primary disconnected interface. Raw 
 | Access | Automatic CAD, 1% duty pacing, synchronized slots, LoRa low-power receive, boosted receive gain, and relay-forwarding toggles |
 | Peers | Four discovered peers per page with RSSI, explicit selection, paging, and automatic-selection reset |
 
-Touch input is accepted once per contact, so holding a control does not repeat it. Button hit boxes exactly match the drawn controls. Notices expire after three seconds, active tests refresh once per second, and idle pages refresh every 15 seconds.
+Touch input is accepted once per contact, so holding a control does not repeat it. Button hit boxes exactly match the drawn controls. Notices expire after three seconds, active tests refresh once per second, and idle pages refresh every 15 seconds. By default, visuals turn off after 60 seconds without physical touch or button activity.
 
 Radio mode/profile changes require explicit Apply or Cancel confirmation. Apply sends the same synchronized command used by `mode sync` or `profile sync`; it does not silently change only the local board. The front button can also apply this confirmation. Deliberate changes are persisted on both peers; automated sweep transitions are explicitly transient.
 
@@ -356,7 +358,7 @@ The recovery access-point password is fixed in source, and the Bluetooth Low Ene
 
 ### Persistent Configuration
 
-The sketch stores one versioned fixed-size configuration blob in the ESP32 Non-Volatile Storage partition. It constructs a zero-initialized current blob and compares it byte-for-byte with the last loaded or written blob. `putBytes()` is called only when a successful setting change produces different bytes, limiting flash wear.
+The sketch stores one versioned fixed-size configuration blob plus a separate visual-timeout value in the ESP32 Non-Volatile Storage partition. Keeping the timeout separate preserves compatibility with existing stored network and radio settings. It constructs a zero-initialized current blob and compares it byte-for-byte with the last loaded or written blob. `putBytes()` is called only when a successful setting change produces different bytes, limiting flash wear.
 
 The following commands use the same serial, HTTP, and Bluetooth command path:
 
@@ -372,8 +374,10 @@ The following commands use the same serial, HTTP, and Bluetooth command path:
 | `wifi address <a.a.a.a/8-30>` | Store a valid unicast station address and CIDR prefix |
 | `wifi clear` | Clear station credentials; the next boot uses the fixed recovery access point |
 | `ble name <name>` | Store a 1-to-24-byte Bluetooth Low Energy device name |
+| `visuals timeout off` | Disable automatic visual blanking |
+| `visuals timeout <seconds>` | Persist an inactivity timeout from 1 through 86,400 seconds |
 
-Wi-Fi credentials/address and the Bluetooth name take effect after restart. LoRa mode/profile, cyclic redundancy check, header, in-phase/quadrature, low-data-rate optimization, whitening, automatic channel detection, duty limiting, low-power receive, receive gain, and relay state apply immediately and persist after successful application. Slotted access, slot epoch, peers, counters, exercises, transfers, results, and relay history remain volatile.
+Wi-Fi credentials/address and the Bluetooth name take effect after restart. LoRa mode/profile, cyclic redundancy check, header, in-phase/quadrature, low-data-rate optimization, whitening, automatic channel detection, duty limiting, low-power receive, receive gain, relay state, and the visual inactivity timeout apply immediately and persist after successful application. The current visual-output state, slotted access, slot epoch, peers, counters, exercises, transfers, results, and relay history remain volatile.
 
 Normal sketch uploads preserve Non-Volatile Storage because erase-all is disabled in the workspace board options. Enabling **Erase All Flash Before Sketch Upload**, changing to an incompatible partition layout, or issuing `config defaults` removes or replaces saved values. This build does not enable Non-Volatile Storage encryption, so the stored Wi-Fi password remains plaintext in flash.
 
@@ -413,6 +417,9 @@ Normal sketch uploads preserve Non-Volatile Storage because erase-all is disable
 | `diag` | Print SX1262 and application diagnostics as comma-separated values |
 | `diag clear` | Clear latched SX1262 device-error bits |
 | `diag calibrate` | Run SX1262 image calibration for the active frequency |
+| `visuals` | Print the visual-output state and inactivity timeout |
+| `visuals on` or `visuals off` | Enable or disable visual output without suspending normal operation |
+| `visuals timeout off` or `visuals timeout <seconds>` | Disable or set the persistent inactivity timeout |
 | `sleep <seconds>` | Enter timer-controlled deep sleep and restart on wake |
 | `peers` | Print the peer table as comma-separated values |
 | `peer auto` | Clear the explicit selection and return to automatic peer selection |

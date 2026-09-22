@@ -16,6 +16,7 @@ See [FEATURES.md](FEATURES.md) for a complete introduction to LoRa and GFSK conc
 - LoRa channel-activity detection
 - Touchscreen operation with five action-oriented pages, live results, and battery status
 - Front-button shortcuts without requiring a serial connection
+- Tap-to-disable visuals with a configurable inactivity timeout
 - Three-second side-button hold for complete hardware shutdown
 - Wi-Fi HTTP and Bluetooth Low Energy command APIs
 - Persistent Wi-Fi, Bluetooth, LoRa, packet, and access configuration in NVS
@@ -98,6 +99,8 @@ The Arduino extension writes reusable build output to the sibling directory `../
 - Protocol replies blocked by access controls enter a four-packet deferred queue and are retried up to ten times.
 - Benchmarks, sweeps, transfers, and pending radio changes are kept mutually exclusive to avoid contaminating measurements or state.
 - Wi-Fi, Bluetooth, LoRa mode/profile, packet options, CAD, duty limiting, low-power receive, receive gain, and relay settings are restored from nonvolatile storage when available.
+- Battery charging is configured and enabled once during startup using the Nesso library defaults. Gauge and charger status are then sampled once per minute using timeout-bounded I2C transactions.
+- The display backlight and indicator LED turn off after 60 seconds without a physical button or touch action by default. Radio, Wi-Fi, Bluetooth, application processing, and active exercises continue normally.
 - A board with station credentials joins that Wi-Fi network. If association fails, it starts the fixed recovery access point `Nesso-<node-id>` at `192.168.4.1/24` with password `nesso-lora`.
 
 ## Controls
@@ -112,8 +115,10 @@ The Arduino extension writes reusable build output to the sibling directory `../
 | `s` | Print local status and send telemetry |
 | `c` | Run LoRa channel-activity detection |
 | `?` or `help` | Print command help |
+| `visuals on\|off` | Enable or disable the display backlight and indicator output |
+| `visuals timeout off\|<seconds>` | Disable or set the persistent 1-to-86,400-second inactivity timeout |
 | Front `KEY1` | Ping on Home, confirm a pending radio change, or return Home |
-| Side `KEY2` | Hold for three seconds to power off the board |
+| Side `KEY2` | Tap to disable visuals; hold for three seconds to power off the board |
 
 ### Touchscreen Controls
 
@@ -127,7 +132,9 @@ The bottom navigation bar provides five pages:
 | Access | Toggle automatic CAD, 1% duty pacing, synchronized slots, low-power receive, boosted gain, and relay forwarding |
 | Peers | Browse discovered nodes, lock selection to a peer, or return to automatic selection |
 
-Radio changes require an on-screen confirmation. The front button confirms that dialog, pings from Home, and otherwise returns to Home. Every page header shows charge percentage and a tiny battery gauge, refreshed once per minute. Cyan indicates charging, yellow or red indicates a low battery, and green indicates normal charge. Gray `--%` means no valid reading; a gray percentage followed by `!` is stale after a failed read or two minutes without a successful refresh. Touch coordinates are rotated to match the landscape display. Holding the side button for three seconds blanks the display and asserts the Nesso N1 hardware power-off control; releasing it early cancels shutdown.
+Radio changes require an on-screen confirmation. The front button confirms that dialog, pings from Home, and otherwise returns to Home. Every page header shows charge percentage and a tiny battery gauge, refreshed once per minute. Cyan indicates charging, yellow or red indicates a low battery, and green indicates normal charge. Gray `--%` means no valid reading; a gray percentage followed by `!` is stale after a failed read or two minutes without a successful refresh. Touch coordinates are rotated to match the landscape display.
+
+A short side-button press disables visual output. The first subsequent touch or button press restores it without triggering the hidden control. The same state can be selected with `visuals on` or `visuals off`; `visuals timeout <seconds>` changes and persists the inactivity period, while `visuals timeout off` disables automatic blanking. No-visuals mode is not a system low-power state: reception, transmissions, Wi-Fi, Bluetooth, timers, commands, and exercises continue normally. Holding the side button continuously for three seconds still performs complete hardware shutdown.
 
 Shutdown sends five low/high pulses, with each level held for 50 ms, to the Nesso power controller. This replaces holding `POWEROFF` continuously high, which can reset the board instead. Wi-Fi, BLE, the display backlight, and the radio are stopped first. If the controller leaves the CPU powered, the fallback is deep sleep with all wake sources disabled, not an automatic restart. Use the separate physical power button to switch the board on again.
 
@@ -151,10 +158,13 @@ Shutdown sends five low/high pulses, with each level held for 50 ms, to the Ness
 
 Packet settings must match at both ends. Use synchronized commands for modulation and profile changes; apply the other packet options manually on both boards.
 
-### Channel Access And Power
+### Visuals, Channel Access And Power
 
 | Input | Action |
 | --- | --- |
+| `visuals` | Show visual-output state and inactivity timeout |
+| `visuals on\|off` | Enable or disable visual output without changing runtime operation |
+| `visuals timeout off\|<seconds>` | Disable or set the persistent inactivity timeout |
 | `cad auto on\|off` | Run LoRa CAD with randomized backoff before each transmission |
 | `duty off` | Disable calculated airtime throttling |
 | `duty <percent>` | Limit transmissions using calculated time on air |
@@ -220,9 +230,9 @@ These commands work identically over serial, HTTP, and Bluetooth Low Energy:
 | `wifi clear` | Clear station credentials and use the fixed recovery AP after restart |
 | `ble name <name>` | Store a Bluetooth Low Energy name of 1 to 24 bytes |
 
-Wi-Fi and Bluetooth identity changes take effect after restart. Static station mode configures the local address and subnet only, with no default gateway or DNS server; it is intended for control from the same subnet. LoRa and access changes take effect immediately and are saved after successful application. Automated sweep profile changes remain transient.
+Wi-Fi and Bluetooth identity changes take effect after restart. Static station mode configures the local address and subnet only, with no default gateway or DNS server; it is intended for control from the same subnet. LoRa, access, and visual-timeout changes take effect immediately and are saved after successful application. Automated sweep profile changes and the current visual-output state remain transient.
 
-The versioned configuration blob is stored in the ESP32 Non-Volatile Storage partition. A byte-for-byte comparison prevents writes when nothing changed. Normal sketch uploads preserve it; enabling **Erase All Flash Before Sketch Upload** clears it. The selected build does not encrypt Non-Volatile Storage, so Wi-Fi credentials are stored in plaintext flash.
+The versioned configuration blob and separate visual-timeout value are stored in the ESP32 Non-Volatile Storage partition. A byte-for-byte comparison prevents blob writes when nothing changed. Normal sketch uploads preserve these values; enabling **Erase All Flash Before Sketch Upload** clears them. The selected build does not encrypt Non-Volatile Storage, so Wi-Fi credentials are stored in plaintext flash.
 
 ## Remote Command API
 
@@ -347,7 +357,7 @@ Protocol acknowledgements and replies that encounter the transmit guard are queu
 
 The GitHub Actions workflow runs firmware regressions, Arduino Lint in strict sketch mode, and a compile for `esp32:esp32:arduino_nesso_n1` on pushes to `master`, pull requests, and manual dispatches. The workflow installs the pinned board core and library versions listed above.
 
-Run the host regressions with `python tests/regressions.py` (Python 3 and a C++17 `g++` or `clang++` compiler are required; `CXX` can select the compiler). They compile actual sketch functions against simulated touch, radio, serial, and I2C hardware to check coordinate rotation, IRQ classification, transfer integrity, shared guards, timeout responsiveness, survey cancellation, and battery freshness. They complement, but do not replace, tests on physical boards.
+Run the host regressions with `python tests/regressions.py` (Python 3 and a C++17 `g++` or `clang++` compiler are required; `CXX` can select the compiler). They compile actual sketch functions against simulated touch, button, display, radio, serial, and I2C hardware to check coordinate rotation, no-visuals timing and wake behavior, IRQ classification, transfer integrity, shared guards, timeout responsiveness, survey cancellation, and battery freshness. They complement, but do not replace, tests on physical boards.
 
 ## License
 

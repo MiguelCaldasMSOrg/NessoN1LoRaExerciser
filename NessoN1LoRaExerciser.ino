@@ -19,6 +19,7 @@
     - LoRa channel-activity detection
     - Serial, button, and onboard display interaction
     - Touchscreen controls for messaging, radio settings, tests, access, and peers
+    - Explicit or inactivity-triggered no-visuals mode without suspending operation
     - Wi-Fi HTTP and Bluetooth Low Energy APIs using the serial command parser
     - Runtime LoRa profile selection and synchronized peer switching
     - GFSK modulation with synchronized LoRa/GFSK changes
@@ -114,6 +115,12 @@
           Cancel the survey and restore the configured receive mode
     diag | diag clear | diag calibrate
           Print, clear, or calibrate SX1262 diagnostics
+        visuals
+          Show the visual-output state and inactivity timeout
+        visuals on|off
+          Enable or disable the display backlight and indicator LED output
+        visuals timeout off|<seconds>
+          Disable or set the persistent inactivity timeout from 1 to 86400 seconds
     sleep <seconds>
           Enter timed ESP32 deep sleep; the sketch restarts on wake
     peers | peer auto|<node-id>
@@ -143,7 +150,7 @@
 
   Buttons:
     KEY1      Ping from Home, confirm a radio change, or return Home
-    KEY2      Hold for three seconds to power off the board
+    KEY2      Tap to disable visuals; hold for three seconds to power off
 
   Touchscreen:
     Header    Show battery charge, updated once per minute
@@ -177,6 +184,9 @@
       known.
     - Automatic CAD, duty-percentage throttling, slotted access, low-power RX,
       boosted gain, and relay forwarding use their last persisted values.
+    - Visuals turn off after 60 seconds without touch or button input by
+      default. This only blanks the LCD/backlight and indicator LED; radio,
+      Wi-Fi, BLE, application processing, and exercises continue normally.
     - Wi-Fi, BLE, LoRa, packet, access, gain, and relay settings are restored
       from NVS. Writes occur only when a stored value actually changes.
     - If configured Wi-Fi station association fails, the fixed recovery access
@@ -297,6 +307,8 @@ constexpr uint32_t POWER_OFF_PULSE_MS = 50;
 constexpr uint8_t POWER_OFF_PULSE_STEPS = 10;
 constexpr uint32_t INPUT_POLL_INTERVAL_MS = 25;
 constexpr uint32_t TOUCH_SETTLE_MS = 25;
+constexpr uint32_t DEFAULT_VISUAL_TIMEOUT_SECONDS = 60;
+constexpr uint32_t MAX_VISUAL_TIMEOUT_SECONDS = 86400;
 constexpr uint16_t I2C_TRANSACTION_TIMEOUT_MS = 20;
 constexpr uint32_t ACK_TIMEOUT_MS = 3500;
 constexpr uint8_t MAX_TEXT_ATTEMPTS = 3;
@@ -387,6 +399,7 @@ constexpr char REMOTE_BLE_COMMAND_UUID[] = "7bbf0002-6ba5-4e35-9f1f-8d36a7f34c01
 constexpr char REMOTE_BLE_STATUS_UUID[] = "7bbf0003-6ba5-4e35-9f1f-8d36a7f34c01";
 constexpr char CONFIG_NAMESPACE[] = "nesso-config";
 constexpr char CONFIG_KEY[] = "settings";
+constexpr char CONFIG_VISUAL_TIMEOUT_KEY[] = "visual-timeout";
 constexpr uint32_t PERSISTENT_CONFIG_MAGIC = 0x4E314346UL;
 constexpr uint16_t PERSISTENT_CONFIG_VERSION = 1;
 
@@ -563,6 +576,8 @@ bool radioOperationBusy = false;
 bool channelSurveyActive = false;
 bool displayReady = false;
 bool touchReady = false;
+bool visualsEnabled = true;
+bool transmittingActive = false;
 RadioMode radioMode = RadioMode::LORA;
 uint8_t activeProfileIndex = 0;
 bool listenBeforeTalkEnabled = false;
@@ -597,6 +612,8 @@ uint32_t uiNoticeUntil = 0;
 uint32_t lastUiRefreshAt = 0;
 uint32_t lastTouchPollAt = 0;
 uint32_t lastButtonPollAt = 0;
+uint32_t lastPhysicalActivityAt = 0;
+uint32_t visualTimeoutSeconds = DEFAULT_VISUAL_TIMEOUT_SECONDS;
 uint32_t touchPressedAt = 0;
 bool previousTouchPressed = false;
 bool touchHandled = false;
@@ -877,6 +894,56 @@ bool savePersistentConfigurationIfChanged() {
   return true;
 }
 
+void loadVisualTimeout() {
+  visualTimeoutSeconds = DEFAULT_VISUAL_TIMEOUT_SECONDS;
+  Preferences preferences;
+  if (!preferences.begin(CONFIG_NAMESPACE, true)) {
+    Serial.println(F("[Visuals] NVS unavailable; using 60-second timeout"));
+    return;
+  }
+
+  const uint32_t storedTimeout = preferences.getUInt(CONFIG_VISUAL_TIMEOUT_KEY, DEFAULT_VISUAL_TIMEOUT_SECONDS);
+  preferences.end();
+  if (storedTimeout > MAX_VISUAL_TIMEOUT_SECONDS) {
+    Serial.println(F("[Visuals] invalid stored timeout; using 60 seconds"));
+    return;
+  }
+  visualTimeoutSeconds = storedTimeout;
+}
+
+bool saveVisualTimeout() {
+  Preferences preferences;
+  if (!preferences.begin(CONFIG_NAMESPACE, false)) {
+    Serial.println(F("[Visuals] could not open NVS for writing"));
+    return false;
+  }
+  const size_t written = preferences.putUInt(CONFIG_VISUAL_TIMEOUT_KEY, visualTimeoutSeconds);
+  preferences.end();
+  if (written != sizeof(visualTimeoutSeconds)) {
+    Serial.println(F("[Visuals] failed to store timeout"));
+    return false;
+  }
+  return true;
+}
+
+bool parseVisualTimeout(const String& value, uint32_t& seconds) {
+  String normalized = value;
+  normalized.trim();
+  if (normalized == "off") {
+    seconds = 0;
+    return true;
+  }
+
+  const char* start = normalized.c_str();
+  char* end = nullptr;
+  const unsigned long parsed = strtoul(start, &end, 10);
+  if (start == end || *end != '\0' || parsed == 0 || parsed > MAX_VISUAL_TIMEOUT_SECONDS) {
+    return false;
+  }
+  seconds = static_cast<uint32_t>(parsed);
+  return true;
+}
+
 bool parseWifiCidr(const String& value, IPAddress& address, uint8_t& prefixLength) {
   const int separator = value.lastIndexOf('/');
   if (separator <= 0 || separator >= static_cast<int>(value.length()) - 1) {
@@ -934,6 +1001,13 @@ void printPersistentConfiguration() {
   Serial.print(radioModeName());
   Serial.print(F(" / "));
   Serial.println(activeLoRaProfile().name);
+  Serial.print(F("Visual timer:  "));
+  if (visualTimeoutSeconds == 0) {
+    Serial.println(F("off"));
+  } else {
+    Serial.print(visualTimeoutSeconds);
+    Serial.println(F(" seconds"));
+  }
   Serial.println(F("Wi-Fi and BLE identity changes take effect after restart."));
   Serial.println(F("--------------------------------"));
 }
@@ -1000,7 +1074,7 @@ void appendJsonEscaped(String& output, const String& value) {
 
 String remoteStatusJson() {
   String json;
-  json.reserve(420);
+  json.reserve(480);
   json += F("{\"node\":\"");
   json += nodeId;
   json += F("\",\"mode\":\"");
@@ -1039,7 +1113,14 @@ String remoteStatusJson() {
   json += F(",\"battery_age_ms\":");
   json += batteryStatusReady ? String(static_cast<uint32_t>(millis() - lastBatterySuccessAt)) : String("null");
   json += F(",\"battery_charging\":");
-  json += !batteryStatusFresh() || !batteryChargeStatusReady ? "null" : (batteryChargeStatus == NessoBattery::PRE_CHARGE || batteryChargeStatus == NessoBattery::CHARGING ? "true" : "false");
+  json += !batteryChargeStatusReady ? "null" : (batteryChargeStatus == NessoBattery::PRE_CHARGE || batteryChargeStatus == NessoBattery::CHARGING ? "true" : "false");
+  json += F(",\"battery_charge_state\":\"");
+  json += batteryChargeStatusName();
+  json += '"';
+  json += F(",\"visuals_enabled\":");
+  json += visualsEnabled ? "true" : "false";
+  json += F(",\"visual_timeout_seconds\":");
+  json += visualTimeoutSeconds;
   json += F(",\"survey_active\":");
   json += channelSurveyActive ? "true" : "false";
   json += '}';
@@ -1361,6 +1442,28 @@ const char* batteryDataState() {
   return !batteryStatusReady ? "unavailable" : (batteryStatusFresh() ? "fresh" : "stale");
 }
 
+const char* batteryChargeStatusName() {
+  if (!batteryChargeStatusReady) {
+    return "unavailable";
+  }
+  switch (batteryChargeStatus) {
+    case NessoBattery::PRE_CHARGE:
+      return "pre-charge";
+    case NessoBattery::CHARGING:
+      return "charging";
+    case NessoBattery::FULL_CHARGE:
+      return "full";
+    default:
+      return "not charging";
+  }
+}
+
+void setupBatteryCharging() {
+  nessoBattery.begin();
+  nessoBattery.enableCharge();
+  Serial.println(F("[Battery] charger configured and enabled"));
+}
+
 bool updateBatteryStatus(bool force = false) {
   const uint32_t now = millis();
   if (!force && static_cast<uint32_t>(now - lastBatteryStatusAt) < BATTERY_STATUS_INTERVAL_MS) {
@@ -1376,6 +1479,9 @@ bool updateBatteryStatus(bool force = false) {
   lastBatteryStatusAt = now;
   batteryReadSucceeded = voltageRead && chargeRead && stateOfCharge <= 100 && voltageMillivolts >= 2000 && voltageMillivolts <= 4500;
   batteryChargeStatusReady = statusRead;
+  if (statusRead) {
+    batteryChargeStatus = static_cast<NessoBattery::ChargeStatus>((chargerSystemStatus >> 3) & 0x03);
+  }
 
   if (!batteryReadSucceeded) {
     return true;
@@ -1383,9 +1489,6 @@ bool updateBatteryStatus(bool force = false) {
 
   batteryVoltage = static_cast<float>(voltageMillivolts) / 1000.0f;
   batteryChargeLevel = stateOfCharge;
-  if (statusRead) {
-    batteryChargeStatus = static_cast<NessoBattery::ChargeStatus>((chargerSystemStatus >> 3) & 0x03);
-  }
   batteryStatusReady = true;
   lastBatterySuccessAt = now;
   return true;
@@ -1593,7 +1696,7 @@ void drawRadioConfirmation() {
 }
 
 void redrawDisplay() {
-  if (!displayReady) {
+  if (!displayReady || !visualsEnabled) {
     return;
   }
 
@@ -1623,6 +1726,43 @@ void redrawDisplay() {
     drawRadioConfirmation();
   }
   lastUiRefreshAt = millis();
+}
+
+void setVisualsEnabled(bool enabled) {
+  visualsEnabled = enabled && displayReady;
+  digitalWrite(LED_BUILTIN, visualsEnabled && transmittingActive ? HIGH : LOW);
+  if (!displayReady) {
+    return;
+  }
+
+  if (visualsEnabled) {
+    redrawDisplay();
+    digitalWrite(LCD_BACKLIGHT, HIGH);
+  } else {
+    nessoDisplay.fillScreen(COLOR_BLACK);
+    digitalWrite(LCD_BACKLIGHT, LOW);
+  }
+}
+
+bool recordPhysicalActivity() {
+  lastPhysicalActivityAt = millis();
+  if (!displayReady || visualsEnabled) {
+    return false;
+  }
+  setVisualsEnabled(true);
+  return true;
+}
+
+void runVisualTimeoutTask() {
+  if (!displayReady || !visualsEnabled || visualTimeoutSeconds == 0) {
+    return;
+  }
+  const uint32_t timeoutMs = visualTimeoutSeconds * 1000UL;
+  if (static_cast<uint32_t>(millis() - lastPhysicalActivityAt) < timeoutMs) {
+    return;
+  }
+  Serial.println(F("[Visuals] inactivity timeout"));
+  setVisualsEnabled(false);
 }
 
 void printRadioError(const char* operation, int state) {
@@ -1820,7 +1960,8 @@ void recordTransmitAirtime(size_t payloadLength) {
 }
 
 void setTransmitting(bool transmitting) {
-  digitalWrite(LED_BUILTIN, transmitting ? HIGH : LOW);
+  transmittingActive = transmitting;
+  digitalWrite(LED_BUILTIN, transmitting && visualsEnabled ? HIGH : LOW);
   // The Nesso N1 reference implementation disables the receive LNA while TX
   // is active, then restores it for receive mode.
   digitalWrite(LORA_LNA_ENABLE, transmitting ? LOW : HIGH);
@@ -1867,6 +2008,7 @@ void setupDisplay() {
 
   displayReady = nessoDisplay.begin();
   if (!displayReady) {
+    visualsEnabled = false;
     Serial.println(F("[Display] initialization failed"));
     return;
   }
@@ -1878,6 +2020,9 @@ void setupDisplay() {
 
   nessoDisplay.setRotation(1);
   nessoDisplay.setTextWrap(false);
+  visualsEnabled = true;
+  lastPhysicalActivityAt = millis();
+  digitalWrite(LCD_BACKLIGHT, HIGH);
   redrawDisplay();
   if (updateBatteryStatus(true)) {
     redrawDisplay();
@@ -2219,6 +2364,15 @@ void printStatus() {
   Serial.println(F(" dBm"));
   Serial.print(F("Radio:       "));
   Serial.println(radioReady ? "ready" : "not ready");
+  Serial.print(F("Visuals:     "));
+  Serial.print(visualsEnabled ? "on" : "off");
+  Serial.print(F(", timeout "));
+  if (visualTimeoutSeconds == 0) {
+    Serial.println(F("off"));
+  } else {
+    Serial.print(visualTimeoutSeconds);
+    Serial.println(F(" s"));
+  }
   Serial.print(F("Battery:     "));
   if (batteryStatusReady) {
     Serial.print(batteryVoltage, 2);
@@ -2232,6 +2386,8 @@ void printStatus() {
   } else {
     Serial.println(F("unavailable"));
   }
+  Serial.print(F("Charger:     "));
+  Serial.println(batteryChargeStatusName());
   Serial.print(F("Packets:     TX "));
   Serial.print(static_cast<unsigned long>(totalPacketsSent));
   Serial.print(F(", RX "));
@@ -3496,6 +3652,7 @@ void handleCommand(String command) {
     Serial.println(F("  survey [startMHz endMHz stepKHz samples]"));
     Serial.println(F("  survey stop"));
     Serial.println(F("  diag | diag clear | diag calibrate"));
+    Serial.println(F("  visuals on|off|timeout <seconds|off>"));
     Serial.println(F("  sleep <seconds>"));
     Serial.println(F("  peers | peer auto|<node-id>"));
     Serial.println(F("  benchmark <packets> [bytes] | benchmark stop|report"));
@@ -3516,6 +3673,8 @@ void handleCommand(String command) {
     } else {
       const PersistentConfiguration defaults = defaultPersistentConfiguration();
       applyPersistentConfiguration(defaults);
+      visualTimeoutSeconds = DEFAULT_VISUAL_TIMEOUT_SECONDS;
+      saveVisualTimeout();
       if (reinitializeRadio()) {
         Serial.println(F("[Config] defaults restored; restart to apply Wi-Fi and BLE defaults"));
       }
@@ -3735,6 +3894,39 @@ void handleCommand(String command) {
     const int state = radio.calibrateImage(activeLoRaProfile().frequencyMHz);
     if (state != RADIOLIB_ERR_NONE) {
       printRadioError("calibrateImage", state);
+    }
+  } else if (command == "visuals") {
+    Serial.print(F("[Visuals] "));
+    Serial.print(visualsEnabled ? "on" : "off");
+    Serial.print(F(", inactivity timeout "));
+    if (visualTimeoutSeconds == 0) {
+      Serial.println(F("off"));
+    } else {
+      Serial.print(visualTimeoutSeconds);
+      Serial.println(F(" seconds"));
+    }
+  } else if (command == "visuals on") {
+    lastPhysicalActivityAt = millis();
+    setVisualsEnabled(true);
+    Serial.println(F("[Visuals] enabled"));
+  } else if (command == "visuals off") {
+    setVisualsEnabled(false);
+    Serial.println(F("[Visuals] disabled"));
+  } else if (command.startsWith("visuals timeout ")) {
+    uint32_t requestedTimeout = 0;
+    if (!parseVisualTimeout(command.substring(16), requestedTimeout)) {
+      Serial.println(F("Usage: visuals timeout off|<1-86400 seconds>"));
+    } else {
+      visualTimeoutSeconds = requestedTimeout;
+      lastPhysicalActivityAt = millis();
+      saveVisualTimeout();
+      Serial.print(F("[Visuals] inactivity timeout "));
+      if (visualTimeoutSeconds == 0) {
+        Serial.println(F("disabled"));
+      } else {
+        Serial.print(visualTimeoutSeconds);
+        Serial.println(F(" seconds"));
+      }
     }
   } else if (command.startsWith("sleep ")) {
     enterTimedDeepSleep(static_cast<uint32_t>(command.substring(6).toInt()));
@@ -4141,7 +4333,7 @@ void pollTouch() {
   if (pressed) {
     if (!wasPressed) {
       touchPressedAt = millis();
-      touchHandled = false;
+      touchHandled = recordPhysicalActivity();
     } else if (!touchHandled && static_cast<uint32_t>(millis() - touchPressedAt) >= TOUCH_SETTLE_MS && x >= 0 && x < UI_WIDTH && y >= 0 && y < UI_HEIGHT) {
       touchHandled = true;
       Serial.printf("[Input] touch x=%d y=%d\r\n", x, y);
@@ -4155,7 +4347,7 @@ void pollTouch() {
 
 void runUiRefreshTask() {
   const bool batteryUpdated = updateBatteryStatus();
-  if (!displayReady) {
+  if (!displayReady || !visualsEnabled) {
     return;
   }
   if (batteryUpdated) {
@@ -4197,7 +4389,7 @@ void powerOffNesso() {
     radio.sleep(false);
     radioReady = false;
   }
-  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(LED_BUILTIN, LOW);
   digitalWrite(LORA_LNA_ENABLE, LOW);
   digitalWrite(LORA_ANTENNA_SWITCH, LOW);
   digitalWrite(LORA_ENABLE, LOW);
@@ -4220,6 +4412,9 @@ void pollButtons() {
 
   const bool key1Pressed = digitalRead(KEY1) == LOW;
   const bool key2Pressed = digitalRead(KEY2) == LOW;
+  const bool key1NewlyPressed = key1Pressed && !previousKey1Pressed;
+  const bool key2NewlyPressed = key2Pressed && !previousKey2Pressed;
+  const bool visualsWoke = (key1NewlyPressed || key2NewlyPressed) && recordPhysicalActivity();
 
   if (key1Pressed != previousKey1Pressed) {
     Serial.printf("[Input] KEY1 %s\r\n", key1Pressed ? "pressed" : "released");
@@ -4229,7 +4424,7 @@ void pollButtons() {
   }
 
   if (now - lastButtonEvent >= 250) {
-    if (key1Pressed && !previousKey1Pressed) {
+    if (key1NewlyPressed && !visualsWoke) {
       lastButtonEvent = now;
       if (uiConfirmationActive) {
         applyUiRadioChange();
@@ -4243,12 +4438,17 @@ void pollButtons() {
   }
 
   if (!key2Pressed) {
+    const bool shortPressCompleted = key2PowerOffArmed && previousKey2Pressed && key2PressedAt != 0;
     key2PowerOffArmed = true;
-    if (previousKey2Pressed && key2PressedAt != 0) {
-      setUiNotice("Power off cancelled");
-    }
     key2PressedAt = 0;
-  } else if (key2PowerOffArmed && !previousKey2Pressed) {
+    if (shortPressCompleted) {
+      Serial.println(F("[Visuals] disabled by KEY2"));
+      setVisualsEnabled(false);
+    }
+  } else if (visualsWoke && key2NewlyPressed) {
+    key2PowerOffArmed = false;
+    key2PressedAt = 0;
+  } else if (key2PowerOffArmed && key2NewlyPressed) {
     key2PressedAt = now;
     setUiNotice("Hold KEY2 3 s to power off", POWER_OFF_HOLD_MS);
   } else if (key2PowerOffArmed && key2PressedAt != 0 && static_cast<uint32_t>(now - key2PressedAt) >= POWER_OFF_HOLD_MS) {
@@ -4290,7 +4490,9 @@ void setup() {
 
   makeNodeId();
   loadPersistentConfiguration();
+  loadVisualTimeout();
   setupNessoIo();
+  setupBatteryCharging();
   setupDisplay();
   setupRadio();
   setupRemoteHttpApi();
@@ -4327,6 +4529,7 @@ void loop() {
   runOutgoingTransferTask();
   runIncomingTransferMaintenance();
   runPeriodicTasks();
+  runVisualTimeoutTask();
   runUiRefreshTask();
   delay(2);
 }
